@@ -7,15 +7,25 @@
 #include "Math.h"
 #include "Context.h"
 
+#ifdef ROCKY_HAS_PROJ
 #include <proj.h>
+#endif
+
 #include <unordered_map>
+#include <cstddef>
+#include <cstdint>
+#include <cmath>
 
 #define LC "[SRS] "
 
 using namespace ROCKY_NAMESPACE;
 using namespace ROCKY_NAMESPACE::detail;
 
+#ifdef ROCKY_HAS_PROJ
 ROCKY_ABOUT(proj, std::to_string(PROJ_VERSION_MAJOR) + "." + std::to_string(PROJ_VERSION_MINOR));
+#else
+ROCKY_ABOUT(rocky_lite_srs, "closed-form (no PROJ)");
+#endif
 
 
 // STATIC INITIALIZATION: built-in common SRS definitions
@@ -26,9 +36,24 @@ const SRS SRS::PLATE_CARREE("plate-carree");
 const SRS SRS::MOON("moon");
 const SRS SRS::EMPTY;
 
-// STATIC INITIALIZATION: PROJ library debug message callback
+// STATIC INITIALIZATION: PROJ (or rocky-lite) debug message callback
 std::function<void(int level, const char* msg)> SRS::projMessageCallback = nullptr;
 
+
+SRS::SRS(std::string_view h) :
+    _definition(h)
+{
+    //nop
+}
+
+
+#ifdef ROCKY_HAS_PROJ
+
+//=============================================================================
+// PROJ-backed implementation (ROCKY_HAS_PROJ). This is the original,
+// general-purpose SRS backend: any WKT string, PROJ string, EPSG code, or
+// well-known alias, full vertical datum support, arbitrary reprojection.
+//=============================================================================
 
 namespace
 {
@@ -573,12 +598,6 @@ SRS::projVersion()
     return std::to_string(PROJ_VERSION_MAJOR) + "." + std::to_string(PROJ_VERSION_MINOR);
 }
 
-SRS::SRS(std::string_view h) :
-    _definition(h)
-{
-    //nop
-}
-
 const char*
 SRS::name() const
 {
@@ -724,12 +743,6 @@ SRS::wkt() const
     return g_srs_factory().get_wkt(definition());
 }
 
-Units
-SRS::units() const
-{
-    return isGeodetic() ? Units::DEGREES : Units::METERS;
-}
-
 const Ellipsoid&
 SRS::ellipsoid() const
 {
@@ -748,12 +761,6 @@ SRS::geodeticBounds() const
     return g_srs_factory().get_geodetic_bounds(definition());
 }
 
-SRSOperation
-SRS::to(const SRS& rhs) const
-{
-    return SRSOperation(*this, rhs);
-}
-
 const SRS&
 SRS::geodeticSRS() const
 {
@@ -764,116 +771,6 @@ const SRS&
 SRS::geocentricSRS() const
 {
     return isGeocentric() ? *this : g_srs_factory().get_or_create(_definition).geocentricSRS;
-}
-
-glm::dmat4
-SRS::topocentricToWorldMatrix(const glm::dvec3& origin) const
-{
-    if (!valid())
-        return { };
-
-    if (isGeodetic())
-    {
-        auto& ellip = ellipsoid();
-        auto ecef = ellip.geodeticToGeocentric(origin);
-        return ellipsoid().topocentricToGeocentricMatrix(ecef);
-    }
-    else if (isGeocentric())
-    {
-        return ellipsoid().topocentricToGeocentricMatrix(origin);
-    }
-    else // projected
-    {
-        return glm::translate(glm::dmat4(1.0), origin);
-    }
-}
-
-double
-SRS::transformUnits(double input, const SRS& inSRS, const SRS& outSRS, const Angle& latitude)
-{
-    ROCKY_SOFT_ASSERT_AND_RETURN(inSRS.valid() && outSRS.valid(), 0.0);
-
-    if (inSRS.isProjected() && outSRS.isGeodetic())
-    {
-        return Units::convert(Units::DEGREES,
-            outSRS.units(),
-            outSRS.ellipsoid().metersToLongitudinalDegrees(
-                inSRS.units().convertTo(Units::METERS, input),
-                latitude.as(Units::DEGREES)));
-    }
-    else if (inSRS.isGeocentric() && outSRS.isGeodetic())
-    {
-        return Units::convert(Units::DEGREES,
-            outSRS.units(),
-            outSRS.ellipsoid().metersToLongitudinalDegrees(input, latitude.as(Units::DEGREES)));
-    }
-    else if (inSRS.isGeodetic() && outSRS.isProjected())
-    {
-        return Units::convert(Units::METERS,
-            outSRS.units(),
-            outSRS.ellipsoid().longitudinalDegreesToMeters(
-                inSRS.units().convertTo(Units::DEGREES, input),
-                latitude.as(Units::DEGREES)));
-    }
-    else if (inSRS.isGeodetic() && outSRS.isGeocentric())
-    {
-        return outSRS.ellipsoid().longitudinalDegreesToMeters(
-            inSRS.units().convertTo(Units::DEGREES, input),
-            latitude.as(Units::DEGREES));
-    }
-    else // both projected or both geographic.
-    {
-        return inSRS.units().convertTo(outSRS.units(), input);
-    }
-}
-
-
-double
-SRS::transformUnits(const Distance& distance, const SRS& outSRS, const Angle& latitude)
-{
-    ROCKY_SOFT_ASSERT_AND_RETURN(outSRS.valid(), distance.value());
-
-    if (distance.units().isDistance() && outSRS.isGeodetic())
-    {
-        return Units::convert(Units::DEGREES,
-            outSRS.units(),
-            outSRS.ellipsoid().metersToLongitudinalDegrees(
-                distance.as(Units::METERS),
-                latitude.as(Units::DEGREES)));
-    }
-    else if (distance.units().isAngle() && outSRS.isProjected())
-    {
-        return Units::convert(Units::METERS,
-            outSRS.units(),
-            outSRS.ellipsoid().longitudinalDegreesToMeters(
-                distance.as(Units::DEGREES),
-                latitude.as(Units::DEGREES)));
-    }
-    else // both projected or both geographic.
-    {
-        return distance.as(outSRS.units());
-    }
-}
-
-double
-SRS::transformDistance(const Distance& input, Units outputUnits, const Angle& referenceLatitude) const
-{
-    auto inputUnits = input.units();
-
-    if (inputUnits.isAngle() && outputUnits.isDistance())
-    {
-        auto meters = ellipsoid().longitudinalDegreesToMeters(input.as(Units::DEGREES), referenceLatitude.as(Units::DEGREES));
-        return Units::convert(Units::METERS, outputUnits, meters);
-    }
-    else if (inputUnits.isDistance() && outputUnits.isAngle())
-    {
-        auto degrees = ellipsoid().metersToLongitudinalDegrees(input.as(Units::METERS), referenceLatitude.as(Units::DEGREES));
-        return Units::convert(Units::DEGREES, outputUnits, degrees);
-    }
-    else
-    {
-        return input.as(outputUnits);
-    }
 }
 
 const std::string&
@@ -1048,32 +945,6 @@ SRSOperation::clamp(double& x, double& y, double& z) const
     if (ok)
         x = temp.x, y = temp.y, z = temp.z;
     return ok;
-#if 0
-    auto& gb = _to.geodeticBounds();
-    if (!gb.valid())
-        return false;
-
-    glm::dvec3 temp(x, y, 0);
-
-    SRSOperation geo;
-    if (!_from.isGeodetic())
-    {
-        geo = _from.to(_from.geodeticSRS());
-        geo.transform(temp.x, temp.y);
-    }
-
-    temp.x = std::max(gb.xmin, std::min(gb.xmax, temp.x));
-    temp.y = std::max(gb.ymin, std::min(gb.ymax, temp.y));
-
-    if (geo.valid())
-    {
-        geo.inverse(temp.x, temp.y);
-    }
-
-    bool clamped = (x != temp.x) || (y != temp.y);
-    x = temp.x, y = temp.y;
-    return clamped;
-#endif
 }
 
 std::string
@@ -1083,6 +954,645 @@ SRSOperation::string() const
         proj_as_proj_string(g_pj_thread_local_context, (PJ*)_handle, PJ_PROJ_5, nullptr));
 }
 
+#else // !ROCKY_HAS_PROJ
+
+//=============================================================================
+// rocky-lite closed-form implementation (ROCKY_HAS_PROJ not defined).
+//
+// Covers exactly the four systems ROCKY_LITE_SPEC.md section 3 asks for:
+// WGS84 geodetic (lon, lat, alt), WGS84 ECEF geocentric, Web/Spherical
+// Mercator, and local ENU tangent planes (which need no SRS of their own --
+// SRS::topocentricToWorldMatrix() below builds them directly from the
+// ellipsoid, for any geodetic or geocentric base SRS).
+//
+// Math reuses rocky::Ellipsoid (Math.h/Ellipsoid.cpp), which was already a
+// pure closed-form (non-iterative Bowring-style) geodetic<->geocentric
+// implementation with no PROJ dependency -- it's what topocentricToWorldMatrix
+// already called into even in the PROJ build. Web Mercator's forward/inverse
+// are the standard spherical formulas (R = WGS84 semi-major axis), hand-written
+// below; cppmap3d (vendored in third_party/cppmap3d, see VERSIONS.md) was
+// evaluated but not used here -- it would need its own lon/lat/alt convention
+// adapted to Rocky's, for no accuracy or simplicity benefit over code that
+// already exists, is tested, and matches the engine's conventions exactly.
+//
+// Everything else (arbitrary EPSG codes, WKT, UTM, QSC, Plate Carree,
+// vertical datums, the Moon SRS, ...) is unsupported here and fails loudly:
+// SRS::valid() returns false and errorMessage() explains why, rather than
+// silently returning garbage coordinates.
+//=============================================================================
+
+namespace
+{
+    const Box empty_box = { };
+    const std::string empty_string = { };
+
+    constexpr double WEB_MERCATOR_RADIUS = 6378137.0; // WGS84 semi-major axis
+
+    enum class LiteKind
+    {
+        Invalid = 0,
+        Geodetic = 1,
+        Geocentric = 2,
+        Mercator = 3
+    };
+
+    //! Entry in the lite SRS registry -- everything we need to know about
+    //! one of the small set of recognized definitions.
+    struct LiteSRSEntry
+    {
+        LiteKind kind = LiteKind::Invalid;
+        Ellipsoid ellipsoid;
+        Box bounds;
+        Box geodeticBounds;
+        std::string error;
+    };
+
+    //! Normalize and classify an SRS definition string. Returns an entry
+    //! with kind == Invalid (and an explanatory error) for anything that
+    //! isn't one of the handful of built-in systems rocky-lite supports.
+    const LiteSRSEntry& classify(const std::string& def)
+    {
+        static const LiteSRSEntry geodetic_entry = []
+            {
+                LiteSRSEntry e;
+                e.kind = LiteKind::Geodetic;
+                e.ellipsoid = Ellipsoid(); // WGS84
+                e.bounds = Box(-180, -90, 180, 90);
+                e.geodeticBounds = e.bounds;
+                return e;
+            }();
+
+        static const LiteSRSEntry geocentric_entry = []
+            {
+                LiteSRSEntry e;
+                e.kind = LiteKind::Geocentric;
+                e.ellipsoid = Ellipsoid(); // WGS84
+                return e;
+            }();
+
+        static const LiteSRSEntry mercator_entry = []
+            {
+                LiteSRSEntry e;
+                e.kind = LiteKind::Mercator;
+                // EPSG:3857 projects WGS84 lon/lat using a *sphere* of radius
+                // equal to the WGS84 semi-major axis -- the ellipsoid PROJ
+                // itself reports for this CRS is that sphere, not the full
+                // WGS84 ellipsoid, even though the input coordinates are
+                // nominally WGS84. Match that here for fidelity.
+                e.ellipsoid = Ellipsoid(WEB_MERCATOR_RADIUS, WEB_MERCATOR_RADIUS);
+                e.bounds = Box(-20037508.342789248, -20037508.342789248, 20037508.342789248, 20037508.342789248);
+                e.geodeticBounds = Box(-180, -85.0511287798066, 180, 85.0511287798066);
+                return e;
+            }();
+
+        static const std::unordered_map<std::string, const LiteSRSEntry*> aliases = {
+            { "wgs84", &geodetic_entry },
+            { "global-geodetic", &geodetic_entry },
+            { "epsg:4326", &geodetic_entry },
+            { "epsg:4979", &geodetic_entry },
+            { "geocentric", &geocentric_entry },
+            { "ecef", &geocentric_entry },
+            { "epsg:4978", &geocentric_entry },
+            { "spherical-mercator", &mercator_entry },
+            { "epsg:3857", &mercator_entry },
+            { "epsg:3785", &mercator_entry }, // legacy alias for the same CRS
+        };
+
+        // cache invalid/unsupported results too, keyed by the exact definition
+        // string, so repeated lookups don't re-build the error message.
+        static std::unordered_map<std::string, LiteSRSEntry> invalid_cache;
+
+        std::string ndef = toLower(trim(def));
+
+        auto alias_iter = aliases.find(ndef);
+        if (alias_iter != aliases.end())
+            return *alias_iter->second;
+
+        auto cached = invalid_cache.find(def);
+        if (cached != invalid_cache.end())
+            return cached->second;
+
+        LiteSRSEntry bad;
+        bad.kind = LiteKind::Invalid;
+        bad.error =
+            "rocky-lite: SRS \"" + def + "\" is not one of the built-in systems supported "
+            "without PROJ (wgs84/epsg:4326, geocentric/ecef/epsg:4978, "
+            "spherical-mercator/epsg:3857). Build with ROCKY_SUPPORTS_PROJ=ON for "
+            "arbitrary EPSG/WKT/PROJ strings, UTM, QSC, vertical datums, etc.";
+        Log()->debug(LC "{}", bad.error);
+
+        if (SRS::projMessageCallback)
+            SRS::projMessageCallback(0, bad.error.c_str());
+
+        return invalid_cache.emplace(def, std::move(bad)).first->second;
+    }
+
+    //! Shared WGS84 ellipsoid instance for the geodetic<->geocentric math
+    //! (avoids reconstructing one per point in hot transform loops).
+    const Ellipsoid& wgs84_ellipsoid()
+    {
+        static const Ellipsoid e;
+        return e;
+    }
+
+    //! Convert a point of the given kind to geodetic (lon, lat, alt-passthrough).
+    glm::dvec3 liteToGeodetic(LiteKind kind, const glm::dvec3& p)
+    {
+        switch (kind)
+        {
+        case LiteKind::Geocentric:
+            return wgs84_ellipsoid().geocentricToGeodetic(p);
+        case LiteKind::Mercator:
+            return glm::dvec3(
+                glm::degrees(p.x / WEB_MERCATOR_RADIUS),
+                glm::degrees(2.0 * std::atan(std::exp(p.y / WEB_MERCATOR_RADIUS)) - M_PI * 0.5),
+                p.z);
+        default: // Geodetic
+            return p;
+        }
+    }
+
+    //! Convert a geodetic (lon, lat, alt-passthrough) point to the given kind.
+    glm::dvec3 liteFromGeodetic(LiteKind kind, const glm::dvec3& lla)
+    {
+        switch (kind)
+        {
+        case LiteKind::Geocentric:
+            return wgs84_ellipsoid().geodeticToGeocentric(lla);
+        case LiteKind::Mercator:
+            return glm::dvec3(
+                glm::radians(lla.x) * WEB_MERCATOR_RADIUS,
+                WEB_MERCATOR_RADIUS * std::log(std::tan(M_PI * 0.25 + glm::radians(lla.y) * 0.5)),
+                lla.z);
+        default: // Geodetic
+            return lla;
+        }
+    }
+
+    //! Transform a single point from one kind to another. Identity when the
+    //! kinds match (avoids needless round-tripping through geodetic, which
+    //! would otherwise introduce tiny floating-point drift for a no-op).
+    glm::dvec3 liteTransform(LiteKind from, LiteKind to, const glm::dvec3& p)
+    {
+        if (from == to)
+            return p;
+        return liteFromGeodetic(to, liteToGeodetic(from, p));
+    }
+
+    //! Encode a (from,to) kind pair into the SRSOperation::_handle void*,
+    //! avoiding any heap allocation/cache management for a 3x3 operation
+    //! space. 0 is reserved to mean "no handle" (matches the PROJ backend's
+    //! use of nullptr for a failed/absent operation).
+    inline void* encode_handle(LiteKind from, LiteKind to)
+    {
+        int code = 1 + (static_cast<int>(from) - 1) * 3 + (static_cast<int>(to) - 1);
+        return reinterpret_cast<void*>(static_cast<std::intptr_t>(code));
+    }
+
+    inline void decode_handle(void* handle, LiteKind& from, LiteKind& to)
+    {
+        int code = static_cast<int>(reinterpret_cast<std::intptr_t>(handle)) - 1;
+        from = static_cast<LiteKind>(1 + code / 3);
+        to = static_cast<LiteKind>(1 + code % 3);
+    }
+
+    thread_local std::string g_last_operation_error;
+}
+
+
+std::string
+SRS::projVersion()
+{
+    return "none (ROCKY_HAS_PROJ is OFF; rocky-lite closed-form SRS backend)";
+}
+
+const char*
+SRS::name() const
+{
+    switch (classify(_definition).kind)
+    {
+    case LiteKind::Geodetic: return "WGS 84";
+    case LiteKind::Geocentric: return "WGS 84 (geocentric)";
+    case LiteKind::Mercator: return "WGS 84 / Pseudo-Mercator";
+    default: return "";
+    }
+}
+
+bool
+SRS::_establish_valid() const
+{
+    _valid = !_definition.empty() && classify(_definition).kind != LiteKind::Invalid;
+    return _valid.value();
+}
+
+bool
+SRS::isGeodetic() const
+{
+    return valid() && classify(_definition).kind == LiteKind::Geodetic;
+}
+
+bool
+SRS::isGeocentric() const
+{
+    return valid() && classify(_definition).kind == LiteKind::Geocentric;
+}
+
+bool
+SRS::isProjected() const
+{
+    return valid() && classify(_definition).kind == LiteKind::Mercator;
+}
+
+bool
+SRS::isQSC() const
+{
+    return false; // QSC requires PROJ
+}
+
+bool
+SRS::hasVerticalDatumShift() const
+{
+    return false; // vertical datums require PROJ
+}
+
+bool
+SRS::equivalentTo(const SRS& rhs) const
+{
+    if (definition().empty() || rhs.definition().empty())
+        return false;
+
+    auto& a = classify(definition());
+    auto& b = classify(rhs.definition());
+    return a.kind != LiteKind::Invalid && a.kind == b.kind;
+}
+
+bool
+SRS::horizontallyEquivalentTo(const SRS& rhs) const
+{
+    // with only one ellipsoid (WGS84) backing every recognized kind here,
+    // horizontal equivalence collapses to the same check as equivalentTo().
+    return equivalentTo(rhs);
+}
+
+const std::string&
+SRS::wkt() const
+{
+    // WKT generation/parsing requires PROJ.
+    return empty_string;
+}
+
+const Ellipsoid&
+SRS::ellipsoid() const
+{
+    return classify(definition()).ellipsoid;
+}
+
+const Box&
+SRS::bounds() const
+{
+    auto& entry = classify(definition());
+    return entry.kind == LiteKind::Invalid ? empty_box : entry.bounds;
+}
+
+const Box&
+SRS::geodeticBounds() const
+{
+    auto& entry = classify(definition());
+    return entry.kind == LiteKind::Invalid ? empty_box : entry.geodeticBounds;
+}
+
+const SRS&
+SRS::geodeticSRS() const
+{
+    if (isGeodetic())
+        return *this;
+    return WGS84;
+}
+
+const SRS&
+SRS::geocentricSRS() const
+{
+    // matches the PROJ backend's actual behavior (not just its doc comment):
+    // any valid non-geocentric SRS -- geodetic or projected -- has a
+    // corresponding geocentric SRS derived from its underlying geodetic CRS.
+    // All three systems rocky-lite supports are WGS84-based, so that's
+    // always ECEF here.
+    if (isGeocentric())
+        return *this;
+    return valid() ? ECEF : EMPTY;
+}
+
+const std::string&
+SRS::errorMessage() const
+{
+    return classify(definition()).error;
+}
+
+std::string
+SRS::string() const
+{
+    return valid() ? definition() : std::string();
+}
+
+const std::string&
+SRSOperation::errorMessage() const
+{
+    return g_last_operation_error;
+}
+
+SRSOperation::SRSOperation(const SRS& from, const SRS& to) :
+    _from(from),
+    _to(to)
+{
+    _nop = (_from == _to);
+    if (_from.valid() && _to.valid())
+    {
+        _handle = encode_handle(classify(_from.definition()).kind, classify(_to.definition()).kind);
+    }
+}
+
+bool
+SRSOperation::forward(void* handle, double& x, double& y, double& z) const
+{
+    if (!handle)
+        return false;
+    LiteKind from, to;
+    decode_handle(handle, from, to);
+    auto out = liteTransform(from, to, glm::dvec3(x, y, z));
+    x = out.x, y = out.y, z = out.z;
+    return true;
+}
+
+bool
+SRSOperation::forward(void* handle, double* x, double* y, double* z, std::size_t stride, std::size_t count) const
+{
+    if (!handle)
+        return false;
+    LiteKind from, to;
+    decode_handle(handle, from, to);
+    auto* xb = reinterpret_cast<std::byte*>(x);
+    auto* yb = reinterpret_cast<std::byte*>(y);
+    auto* zb = reinterpret_cast<std::byte*>(z);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        double* px = reinterpret_cast<double*>(xb + i * stride);
+        double* py = reinterpret_cast<double*>(yb + i * stride);
+        double* pz = reinterpret_cast<double*>(zb + i * stride);
+        auto out = liteTransform(from, to, glm::dvec3(*px, *py, *pz));
+        *px = out.x, *py = out.y, *pz = out.z;
+    }
+    return true;
+}
+
+bool
+SRSOperation::inverse(void* handle, double& x, double& y, double& z) const
+{
+    if (!handle)
+        return false;
+    LiteKind from, to;
+    decode_handle(handle, from, to);
+    auto out = liteTransform(to, from, glm::dvec3(x, y, z));
+    x = out.x, y = out.y, z = out.z;
+    return true;
+}
+
+bool
+SRSOperation::inverse(void* handle, double* x, double* y, double* z, std::size_t stride, std::size_t count) const
+{
+    if (!handle)
+        return false;
+    LiteKind from, to;
+    decode_handle(handle, from, to);
+    auto* xb = reinterpret_cast<std::byte*>(x);
+    auto* yb = reinterpret_cast<std::byte*>(y);
+    auto* zb = reinterpret_cast<std::byte*>(z);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        double* px = reinterpret_cast<double*>(xb + i * stride);
+        double* py = reinterpret_cast<double*>(yb + i * stride);
+        double* pz = reinterpret_cast<double*>(zb + i * stride);
+        auto out = liteTransform(to, from, glm::dvec3(*px, *py, *pz));
+        *px = out.x, *py = out.y, *pz = out.z;
+    }
+    return true;
+}
+
+Box
+SRSOperation::transformBounds(const Box& in) const
+{
+    if (!valid())
+        return {};
+    if (_nop)
+        return in;
+
+    // densify the rectangle boundary like the PROJ backend does, since a
+    // straight-corners-only transform under a nonlinear projection like
+    // Mercator can under-estimate the output extent.
+    constexpr int N = 21;
+    Box out;
+    bool any = false;
+    for (int i = 0; i <= N; ++i)
+    {
+        double tx = in.xmin + (in.xmax - in.xmin) * (double(i) / N);
+        for (int edge = 0; edge < 2; ++edge)
+        {
+            double ty = edge == 0 ? in.ymin : in.ymax;
+            double x = tx, y = ty, z = 0.0;
+            if (transform(x, y, z))
+            {
+                if (!any) { out = Box(x, y, x, y); any = true; }
+                else out.expandBy(glm::dvec3(x, y, z));
+            }
+        }
+    }
+    for (int i = 0; i <= N; ++i)
+    {
+        double ty = in.ymin + (in.ymax - in.ymin) * (double(i) / N);
+        for (int edge = 0; edge < 2; ++edge)
+        {
+            double tx = edge == 0 ? in.xmin : in.xmax;
+            double x = tx, y = ty, z = 0.0;
+            if (transform(x, y, z))
+            {
+                if (!any) { out = Box(x, y, x, y); any = true; }
+                else out.expandBy(glm::dvec3(x, y, z));
+            }
+        }
+    }
+
+    if (!any)
+        return {};
+
+    if (!_to.isGeodetic() && _to.bounds().valid())
+    {
+        return Box(
+            std::max(out.xmin, _to.bounds().xmin), std::max(out.ymin, _to.bounds().ymin),
+            std::min(out.xmax, _to.bounds().xmax), std::min(out.ymax, _to.bounds().ymax));
+    }
+    return out;
+}
+
+bool
+SRSOperation::clamp(double& x, double& y, double& z) const
+{
+    glm::dvec3 temp(x, y, z);
+    bool ok = clampArray(&temp, 1);
+    if (ok)
+        x = temp.x, y = temp.y, z = temp.z;
+    return ok;
+}
+
+std::string
+SRSOperation::string() const
+{
+    if (!_handle)
+        return {};
+    LiteKind from, to;
+    decode_handle(_handle, from, to);
+    auto name_of = [](LiteKind k)
+        {
+            switch (k)
+            {
+            case LiteKind::Geodetic: return "geodetic";
+            case LiteKind::Geocentric: return "geocentric";
+            case LiteKind::Mercator: return "spherical-mercator";
+            default: return "invalid";
+            }
+        };
+    return std::string(name_of(from)) + " -> " + name_of(to);
+}
+
+#endif // ROCKY_HAS_PROJ
+
+
+//=============================================================================
+// Shared (backend-independent) implementations. These only ever call into
+// SRS::isGeodetic()/isGeocentric()/isProjected()/ellipsoid(), all of which
+// are backend-specific above, and into rocky::Ellipsoid, which has always
+// been pure closed-form math with no PROJ dependency.
+//=============================================================================
+
+Units
+SRS::units() const
+{
+    return isGeodetic() ? Units::DEGREES : Units::METERS;
+}
+
+SRSOperation
+SRS::to(const SRS& rhs) const
+{
+    return SRSOperation(*this, rhs);
+}
+
+glm::dmat4
+SRS::topocentricToWorldMatrix(const glm::dvec3& origin) const
+{
+    if (!valid())
+        return { };
+
+    if (isGeodetic())
+    {
+        auto& ellip = ellipsoid();
+        auto ecef = ellip.geodeticToGeocentric(origin);
+        return ellipsoid().topocentricToGeocentricMatrix(ecef);
+    }
+    else if (isGeocentric())
+    {
+        return ellipsoid().topocentricToGeocentricMatrix(origin);
+    }
+    else // projected
+    {
+        return glm::translate(glm::dmat4(1.0), origin);
+    }
+}
+
+double
+SRS::transformUnits(double input, const SRS& inSRS, const SRS& outSRS, const Angle& latitude)
+{
+    ROCKY_SOFT_ASSERT_AND_RETURN(inSRS.valid() && outSRS.valid(), 0.0);
+
+    if (inSRS.isProjected() && outSRS.isGeodetic())
+    {
+        return Units::convert(Units::DEGREES,
+            outSRS.units(),
+            outSRS.ellipsoid().metersToLongitudinalDegrees(
+                inSRS.units().convertTo(Units::METERS, input),
+                latitude.as(Units::DEGREES)));
+    }
+    else if (inSRS.isGeocentric() && outSRS.isGeodetic())
+    {
+        return Units::convert(Units::DEGREES,
+            outSRS.units(),
+            outSRS.ellipsoid().metersToLongitudinalDegrees(input, latitude.as(Units::DEGREES)));
+    }
+    else if (inSRS.isGeodetic() && outSRS.isProjected())
+    {
+        return Units::convert(Units::METERS,
+            outSRS.units(),
+            outSRS.ellipsoid().longitudinalDegreesToMeters(
+                inSRS.units().convertTo(Units::DEGREES, input),
+                latitude.as(Units::DEGREES)));
+    }
+    else if (inSRS.isGeodetic() && outSRS.isGeocentric())
+    {
+        return outSRS.ellipsoid().longitudinalDegreesToMeters(
+            inSRS.units().convertTo(Units::DEGREES, input),
+            latitude.as(Units::DEGREES));
+    }
+    else // both projected or both geographic.
+    {
+        return inSRS.units().convertTo(outSRS.units(), input);
+    }
+}
+
+
+double
+SRS::transformUnits(const Distance& distance, const SRS& outSRS, const Angle& latitude)
+{
+    ROCKY_SOFT_ASSERT_AND_RETURN(outSRS.valid(), distance.value());
+
+    if (distance.units().isDistance() && outSRS.isGeodetic())
+    {
+        return Units::convert(Units::DEGREES,
+            outSRS.units(),
+            outSRS.ellipsoid().metersToLongitudinalDegrees(
+                distance.as(Units::METERS),
+                latitude.as(Units::DEGREES)));
+    }
+    else if (distance.units().isAngle() && outSRS.isProjected())
+    {
+        return Units::convert(Units::METERS,
+            outSRS.units(),
+            outSRS.ellipsoid().longitudinalDegreesToMeters(
+                distance.as(Units::DEGREES),
+                latitude.as(Units::DEGREES)));
+    }
+    else // both projected or both geographic.
+    {
+        return distance.as(outSRS.units());
+    }
+}
+
+double
+SRS::transformDistance(const Distance& input, Units outputUnits, const Angle& referenceLatitude) const
+{
+    auto inputUnits = input.units();
+
+    if (inputUnits.isAngle() && outputUnits.isDistance())
+    {
+        auto meters = ellipsoid().longitudinalDegreesToMeters(input.as(Units::DEGREES), referenceLatitude.as(Units::DEGREES));
+        return Units::convert(Units::METERS, outputUnits, meters);
+    }
+    else if (inputUnits.isDistance() && outputUnits.isAngle())
+    {
+        auto degrees = ellipsoid().metersToLongitudinalDegrees(input.as(Units::METERS), referenceLatitude.as(Units::DEGREES));
+        return Units::convert(Units::DEGREES, outputUnits, degrees);
+    }
+    else
+    {
+        return input.as(outputUnits);
+    }
+}
 
 #include "json.h"
 namespace ROCKY_NAMESPACE

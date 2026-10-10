@@ -34,18 +34,24 @@ list(APPEND DATA_FILES "${PROJECT_SOURCE_DIR}/data/fonts/times.vsgb")
 
 # find dependecies ----
 
-# PROJ - geospatial projections library - required
-find_package(PROJ CONFIG QUIET)
-if (NOT PROJ_FOUND)
-    # backup plan for older Ubuntu PROJ releases without cmake files
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(PROJ REQUIRED proj)
-    add_library(PROJ::proj INTERFACE IMPORTED)
-    set_target_properties(PROJ::proj PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${PROJ_INCLUDE_DIRS}"
-        INTERFACE_LINK_LIBRARIES "${PROJ_LIBRARIES}")
+# PROJ - geospatial projections library - optional (ROCKY_SUPPORTS_PROJ,
+# default ON; forced OFF by ROCKY_LITE). When off, SRS.cpp falls back to a
+# small closed-form implementation covering only WGS84 geodetic, ECEF
+# geocentric, and Web/Spherical Mercator -- see ROCKY_LITE_SPEC.md
+# section 3 and docs/ROCKY_LITE_NOTES.md.
+if(BUILD_WITH_PROJ)
+    find_package(PROJ CONFIG QUIET)
+    if (NOT PROJ_FOUND)
+        # backup plan for older Ubuntu PROJ releases without cmake files
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(PROJ REQUIRED proj)
+        add_library(PROJ::proj INTERFACE IMPORTED)
+        set_target_properties(PROJ::proj PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${PROJ_INCLUDE_DIRS}"
+            INTERFACE_LINK_LIBRARIES "${PROJ_LIBRARIES}")
+    endif()
+    set(ROCKY_HAS_PROJ TRUE)
 endif()
-set(ROCKY_HAS_PROJ TRUE)
 
 # glm - vector and matrix math library - required
 find_package(glm CONFIG REQUIRED)
@@ -134,8 +140,12 @@ endif()
 # set up library dependencies
 set(PUBLIC_LIBS glm::glm spdlog::spdlog)
 
-set(PRIVATE_LIBS PROJ::proj)
-    
+set(PRIVATE_LIBS)
+
+if(ROCKY_HAS_PROJ)
+    list(APPEND PRIVATE_LIBS PROJ::proj)
+endif()
+
 if(GDAL_FOUND)
     if (EXISTS "${GDAL_INCLUDE_DIR}/ogr_geocoding.h")
         set(ROCKY_HAS_GEOCODER TRUE) # Version.h.in

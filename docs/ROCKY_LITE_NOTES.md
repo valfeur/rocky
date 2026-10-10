@@ -373,3 +373,118 @@ error anywhere in the whole `rocky` target is `SRS.cpp`'s
 `#include <proj.h>` itself -- i.e. Phase 1's vendoring is complete and
 PROJ in `SRS.cpp` is the sole remaining blocker to a from-scratch
 ROCKY_LITE build, exactly as Phase 2 is scoped to address.
+
+## Phase 2 — Remove GDAL / PROJ (done)
+
+GDAL needed no further work here: Phase 1 already made it optional and
+off by default in `ROCKY_LITE` (`ROCKY_SUPPORTS_GDAL`), and `GDAL.cpp` and
+every other GDAL-dependent file are already internally guarded with
+`#ifdef ROCKY_HAS_GDAL`, so they compile to nothing when it's off. All of
+Phase 2's work was PROJ, in `src/rocky/SRS.cpp`.
+
+**New option `ROCKY_SUPPORTS_PROJ`** (default ON, forced OFF by
+`ROCKY_LITE`) now gates PROJ the same way `ROCKY_SUPPORTS_GDAL` gates
+GDAL — this is new; previously PROJ had no option at all and was simply
+`find_package(PROJ CONFIG REQUIRED)` unconditionally. `ROCKY_HAS_PROJ`
+(the `#cmakedefine` that `Version.h.in` already had a slot for, previously
+always set `TRUE` unconditionally in `src/rocky/CMakeLists.txt`) is now
+only defined when `BUILD_WITH_PROJ` is on.
+
+**`SRS.cpp` now has two backends behind `#ifdef ROCKY_HAS_PROJ`**, with the
+public `SRS`/`SRSOperation` API in `SRS.h` completely unchanged (every
+caller in the codebase compiles against either backend with zero changes):
+
+- **`ROCKY_HAS_PROJ` defined**: the original implementation, byte-for-byte
+  unchanged, just wrapped in `#ifdef`. Full WKT/PROJ-string/EPSG support,
+  UTM, QSC, Plate Carree, vertical datums, arbitrary reprojection.
+- **`ROCKY_HAS_PROJ` not defined (the `ROCKY_LITE` default)**: a small
+  closed-form backend covering exactly the four systems
+  `ROCKY_LITE_SPEC.md` section 3 asks for -- WGS84 geodetic, WGS84 ECEF,
+  Web/Spherical Mercator, and local ENU (which needs no SRS of its own;
+  `topocentricToWorldMatrix()` already built it directly from the
+  ellipsoid, backend-independently, even in the PROJ build). A small
+  `classify()` registry recognizes only `wgs84`/`epsg:4326`/`epsg:4979`/
+  `global-geodetic` (geodetic), `geocentric`/`ecef`/`epsg:4978`
+  (geocentric), and `spherical-mercator`/`epsg:3857`/`epsg:3785`
+  (Mercator) -- case-insensitively, matching the original's aliasing.
+  **Anything else is rejected outright**: `SRS::valid()` returns false and
+  `errorMessage()` explains why, rather than silently returning garbage --
+  per the spec's explicit requirement. This means `SRS::PLATE_CARREE` and
+  `SRS::MOON` (both pre-existing Rocky built-ins, used by `Profile.cpp` for
+  the "plate-carree" and lunar-QSC map profiles) are simply invalid under
+  `ROCKY_LITE`; requesting either of those profiles fails loudly rather
+  than rendering a wrong map. That's an intentional, spec-directed
+  reduction in lite-mode GIS features, not a bug.
+
+**cppmap3d was evaluated but not used.** The user suggested it going into
+Phase 2 to avoid hand-writing the conversions. It turned out unnecessary:
+`rocky::Ellipsoid` (`Ellipsoid.h`/`.cpp`) was *already* a complete,
+closed-form (non-iterative, Bowring-style), PROJ-free implementation of
+geodetic<->geocentric conversion, degree/meter conventions matching
+exactly what the rest of the engine expects (`SRS::topocentricToWorldMatrix`
+already called into it even in the PROJ build, for the ENU matrix). Routing
+that through cppmap3d instead would have meant adapting between its
+lat/lon/alt convention and Rocky's lon/lat/alt-degrees one, for no accuracy
+or simplicity benefit over code that already exists, is already exercised
+by the engine, and needed zero new review. Web/Spherical Mercator (the one
+piece `Ellipsoid` didn't already cover) is hand-written: the standard
+spherical forward/inverse formulas with R = the WGS84 semi-major axis,
+matching what PROJ actually computes for EPSG:3857 (which projects WGS84
+lon/lat using *spherical*, not ellipsoidal, math -- the well-known "Web
+Mercator" simplification). `cppmap3d` stays vendored in
+`third_party/cppmap3d` (Apache-2.0, see VERSIONS.md) in case a later phase
+finds a genuine use for it; nothing currently links against it.
+
+**`SRSOperation`'s `_handle`** (a `void*`, previously always a cached
+`PJ*`) is reused for the lite backend too, but encodes a `(fromKind,
+toKind)` pair as a small nonzero integer instead of a pointer -- with
+only 3 possible kinds (3x3 = 9 operations), this needed neither a cache
+nor any allocation/ownership to manage.
+
+**Test changes** (`src/tests/tests.cpp`): the entire pre-existing `"SRS"`
+test case (UTM, QSC, Plate Carree, EGM96 vertical datums, exact PROJ
+error-message strings, arbitrary EPSG codes) is now wrapped in `#ifdef
+ROCKY_HAS_PROJ` -- none of that is lite-backend territory, and it runs
+unchanged whenever `ROCKY_HAS_PROJ` is defined. A new unconditional test
+case, `"SRS core (no PROJ required)"`, covers exactly what the spec asks
+for and runs under *both* backends (so they're held to consistent
+answers): round-trip geodetic<->ECEF (checked to 1e-6), the known point
+lon 0/lat 0/alt 0 -> ECEF (6378137, 0, 0), a Mercator round trip including
+the exact 180 deg -> 20037508.342789248 m edge value, ENU basis
+orthonormality (unit length, mutual orthogonality, right-handedness, and
+that the translation column matches the geocentric origin) across several
+latitudes including near the poles, and a check that an unsupported SRS
+(`epsg:32632`, UTM) fails loudly rather than validating.
+
+Two more pre-existing tests assumed PROJ was always available and needed
+small adjustments once it became optional (both found only by actually
+building and running the suite, not by reading the diff): `"Profile hashes
+agree with equality"` built a `Profile` from the compound CRS
+`"EPSG:4326+5773"` and a `Profile(SRS::MOON, ...)` as part of its fixture
+data; both are correctly invalid under the lite backend now, so the test
+drops the compound-CRS entry under `ROCKY_HAS_PROJ` only and substitutes
+`SRS::SPHERICAL_MERCATOR` for `SRS::MOON` as its "a profile with a
+different SRS" example when `ROCKY_HAS_PROJ` is off (preserving the
+test's actual intent -- distinct SRS => distinct profile -- without
+depending on PROJ).
+
+**Validated by actually building and running the test suite**, not just
+compiling: a from-scratch `ROCKY_LITE=ON` configure now needs no PROJ
+stub at all (`ROCKY_SUPPORTS_PROJ` is genuinely optional end to end), and
+`rocky_tests.exe` passes **90 of 93 test cases, 5615 of 5618 assertions**.
+The 3 remaining failures (`"TMS"`, `"IO > HTTP"`, `"Earth File"`) are all
+pre-existing network/HTTP tests, unrelated to SRS/PROJ: they fail because
+`ROCKY_LITE` also forces `ROCKY_SUPPORTS_HTTPS=OFF` (Phase 1, and
+`ROCKY_LITE_SPEC.md`'s own non-goals explicitly exclude HTTPS/TLS), and
+two of the three try to fetch `https://` URLs outright rather than
+checking `URI::supportsHTTPS()` first and skipping gracefully the way the
+adjacent `"IO > HTTPS"` test case already does (its own output: "HTTPS
+support is not available - skipping HTTP tests"). The third
+(`"IO > HTTP"`, plain `http://127.0.0.1:<port>` loopback) timed out in
+this sandbox for reasons not yet investigated -- possibly environment
+network-isolation rather than anything-lite-specific. None of this is
+SRS/PROJ-related; it's recorded here as a known gap for whoever does
+Phase 3 (HTTP and tile sources), where `EarthFileImporter`/the `TMS`
+driver's own HTTPS-availability handling would be the natural place to
+fix the first two, and the loopback case deserves a quick look in
+isolation.

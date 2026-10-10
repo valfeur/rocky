@@ -2625,10 +2625,16 @@ TEST_CASE("Profile hashes agree with equality", "[profile][tilekey]")
 {
     const Profile named("global-geodetic");
     const Box world(-180.0, -90.0, 180.0, 90.0);
-    const std::vector<Profile> equivalents = {
+    std::vector<Profile> equivalents = {
         named, Profile(SRS::WGS84, world, 2, 1), Profile(SRS("EPSG:4326"), world, 2, 1),
-        Profile(SRS("EPSG:4979"), world, 2, 1), Profile(SRS("EPSG:4326+5773"), world, 2, 1)
+        Profile(SRS("EPSG:4979"), world, 2, 1)
     };
+#ifdef ROCKY_HAS_PROJ
+    // "EPSG:4326+5773" is a compound CRS (WGS84 horizontal + EGM96 vertical
+    // datum); the ROCKY_HAS_PROJ=OFF closed-form SRS backend only supports
+    // plain WGS84/ECEF/Web-Mercator and correctly rejects it (see SRS.cpp).
+    equivalents.push_back(Profile(SRS("EPSG:4326+5773"), world, 2, 1));
+#endif
     std::unordered_map<Profile, int> profiles;
     std::unordered_map<TileKey, int> tiles;
     std::map<TileKey, int> ordered;
@@ -2661,8 +2667,16 @@ TEST_CASE("Profile hashes agree with equality", "[profile][tilekey]")
     approximate.emplace(a, 1);
     CHECK(approximate.count(b) == 1u);
 
+    // SRS::MOON requires PROJ (it's not one of the lite backend's supported
+    // systems); substitute another already-distinct SRS so this still
+    // exercises "different SRS => different profile" without it.
+#ifdef ROCKY_HAS_PROJ
+    const SRS otherSRS = SRS::MOON;
+#else
+    const SRS otherSRS = SRS::SPHERICAL_MERCATOR;
+#endif
     const std::vector<Profile> different = {
-        a, Profile(SRS::MOON, world, 2, 1), Profile(SRS::WGS84, world, 1, 1),
+        a, Profile(otherSRS, world, 2, 1), Profile(SRS::WGS84, world, 1, 1),
         Profile(SRS::WGS84, world, 2, 1, Box(-180.0, -80.0, 180.0, 80.0))
     };
     for (const auto& profile : different)
@@ -2800,6 +2814,13 @@ TEST_CASE("TMS")
     CHECK((s.ok() || s.error().type == Failure::ResourceUnavailable));
 }
 
+#ifdef ROCKY_HAS_PROJ
+// This whole test case exercises PROJ-specific behavior: arbitrary EPSG
+// codes, UTM, QSC, Plate Carree, vertical datums/EGM96, and exact PROJ
+// error-message strings -- none of which the ROCKY_HAS_PROJ=OFF closed-form
+// SRS backend supports (by design; see SRS.cpp and ROCKY_LITE_SPEC.md
+// section 3). See the "SRS core (no PROJ required)" test case below for
+// the coverage that runs unconditionally.
 TEST_CASE("SRS")
 {
     // epsilon
@@ -3217,6 +3238,121 @@ TEST_CASE("SRS")
         ")";
         Profile profile;
         profile.from_json(json);
+    }
+}
+#endif // ROCKY_HAS_PROJ
+
+//! Covers ROCKY_LITE_SPEC.md section 3's required SRS coverage for the
+//! closed-form (no-PROJ) backend: round-trip geodetic<->ECEF, a known
+//! point, a Mercator round trip, and ENU basis orthonormality. Runs
+//! unconditionally (not just when ROCKY_HAS_PROJ is off) so both backends
+//! are held to the same answers for the systems they both support.
+TEST_CASE("SRS core (no PROJ required)")
+{
+    const double E = 1e-6;
+
+    SECTION("Known point: lon 0, lat 0, alt 0 -> ECEF (6378137, 0, 0)")
+    {
+        glm::dvec3 out;
+        REQUIRE(SRS::WGS84.to(SRS::ECEF).transform(glm::dvec3(0, 0, 0), out));
+        CHECK(glm::all(glm::epsilonEqual(out, glm::dvec3(6378137.0, 0.0, 0.0), E)));
+    }
+
+    SECTION("Round trip: geodetic -> ECEF -> geodetic")
+    {
+        const std::vector<glm::dvec3> samples = {
+            { 0, 0, 0 }, { -77, 42, 150 }, { 151.2, -33.9, 1000 },
+            { 179.9, 89.9, 0 }, { -179.9, -89.9, 8848 }, { 45, 45, -10 }
+        };
+
+        auto toECEF = SRS::WGS84.to(SRS::ECEF);
+        auto toGeodetic = SRS::ECEF.to(SRS::WGS84);
+        REQUIRE(toECEF.valid());
+        REQUIRE(toGeodetic.valid());
+
+        for (auto& lla : samples)
+        {
+            glm::dvec3 ecef, back;
+            REQUIRE(toECEF.transform(lla, ecef));
+            REQUIRE(toGeodetic.transform(ecef, back));
+            CHECK(glm::epsilonEqual(back.x, lla.x, E));
+            CHECK(glm::epsilonEqual(back.y, lla.y, E));
+            CHECK(glm::epsilonEqual(back.z, lla.z, 1e-3)); // meters
+        }
+    }
+
+    SECTION("Mercator round trip")
+    {
+        auto toMerc = SRS::WGS84.to(SRS::SPHERICAL_MERCATOR);
+        auto toGeodetic = SRS::SPHERICAL_MERCATOR.to(SRS::WGS84);
+        REQUIRE(toMerc.valid());
+        REQUIRE(toGeodetic.valid());
+
+        const std::vector<glm::dvec3> samples = {
+            { 0, 0, 0 }, { -180, 0, 0 }, { 180, 0, 0 },
+            { -122.4, 37.8, 0 }, { 2.4, 49.0, 0 }, { 0, 80, 0 }
+        };
+
+        for (auto& lla : samples)
+        {
+            glm::dvec3 merc, back;
+            REQUIRE(toMerc.transform(lla, merc));
+            REQUIRE(toGeodetic.transform(merc, back));
+            CHECK(glm::epsilonEqual(back.x, lla.x, E));
+            CHECK(glm::epsilonEqual(back.y, lla.y, E));
+        }
+
+        // known value: 180 degrees longitude is the full mercator extent
+        glm::dvec3 edge;
+        REQUIRE(toMerc.transform(glm::dvec3(180, 0, 0), edge));
+        CHECK(glm::epsilonEqual(edge.x, 20037508.342789248, 1e-3));
+    }
+
+    SECTION("ENU basis is orthonormal")
+    {
+        const std::vector<glm::dvec3> origins = {
+            { 0, 0, 0 }, { -122.4, 37.8, 100 }, { 2.4, 49.0, 8000 }, { 0, 89, 0 }
+        };
+
+        for (auto& origin : origins)
+        {
+            auto ecef_origin = SRS::WGS84.ellipsoid().geodeticToGeocentric(origin);
+            auto m = SRS::WGS84.topocentricToWorldMatrix(origin);
+
+            glm::dvec3 east(m[0][0], m[0][1], m[0][2]);
+            glm::dvec3 north(m[1][0], m[1][1], m[1][2]);
+            glm::dvec3 up(m[2][0], m[2][1], m[2][2]);
+
+            // unit length
+            CHECK(glm::epsilonEqual(glm::length(east), 1.0, E));
+            CHECK(glm::epsilonEqual(glm::length(north), 1.0, E));
+            CHECK(glm::epsilonEqual(glm::length(up), 1.0, E));
+
+            // mutually orthogonal
+            CHECK(glm::epsilonEqual(glm::dot(east, north), 0.0, E));
+            CHECK(glm::epsilonEqual(glm::dot(north, up), 0.0, E));
+            CHECK(glm::epsilonEqual(glm::dot(up, east), 0.0, E));
+
+            // right-handed: east x north == up
+            auto cross = glm::cross(east, north);
+            CHECK(glm::all(glm::epsilonEqual(cross, up, E)));
+
+            // translation column matches the geocentric origin
+            glm::dvec3 translation(m[3][0], m[3][1], m[3][2]);
+            CHECK(glm::all(glm::epsilonEqual(translation, ecef_origin, 1e-3)));
+        }
+    }
+
+    SECTION("Unsupported SRS fails loudly rather than returning garbage")
+    {
+        SRS bad("epsg:32632"); // UTM -- not one of the lite-supported systems
+#ifndef ROCKY_HAS_PROJ
+        CHECK(bad.valid() == false);
+        CHECK(bad.isGeodetic() == false);
+        CHECK(bad.isProjected() == false);
+        CHECK(bad.isGeocentric() == false);
+        CHECK(!bad.errorMessage().empty());
+#endif
     }
 }
 

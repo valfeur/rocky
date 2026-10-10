@@ -23,6 +23,7 @@ option(ROCKY_SUPPORTS_HTTPLIB "Support HTTP with the lightweight cpp-httplib lib
 option(ROCKY_SUPPORTS_HTTPS "Support HTTPS (requires openssl)" ON)
 option(ROCKY_SUPPORTS_IMGUI "Support Dear ImGui and build ImGui-based demos" ON)
 option(ROCKY_SUPPORTS_MBTILES "Support MBTiles databases with extended spatial profile support (requires sqlite3, zlib)" ON)
+option(ROCKY_SUPPORTS_PROJ "Support the full PROJ coordinate/projection library (plate-carree, UTM, QSC, vertical datums, arbitrary EPSG/WKT, ...). When OFF, SRS uses a small closed-form implementation covering only WGS84 geodetic, ECEF geocentric, and Web/Spherical Mercator." ON)
 option(ROCKY_SUPPORTS_QT "Build Qt demos" OFF)
 option(ROCKY_SUPPORTS_SLUGHORN "Support Slughorn vector decals" ON)
 
@@ -47,6 +48,7 @@ if(ROCKY_LITE)
     set(ROCKY_SUPPORTS_HTTPLIB ON CACHE BOOL "" FORCE)
     set(ROCKY_SUPPORTS_HTTPS OFF CACHE BOOL "" FORCE)
     set(ROCKY_SUPPORTS_MBTILES OFF CACHE BOOL "" FORCE)
+    set(ROCKY_SUPPORTS_PROJ OFF CACHE BOOL "" FORCE)
     set(ROCKY_SUPPORTS_QT OFF CACHE BOOL "" FORCE)
     set(ROCKY_SUPPORTS_SLUGHORN OFF CACHE BOOL "" FORCE)
 
@@ -142,6 +144,10 @@ endif()
 if (ROCKY_SUPPORTS_MBTILES)
     set(BUILD_WITH_SQLITE3 ON)
     set(BUILD_WITH_ZLIB ON)
+endif()
+
+if(ROCKY_SUPPORTS_PROJ)
+    set(BUILD_WITH_PROJ ON)
 endif()
 
 if(ROCKY_SUPPORTS_QT)
