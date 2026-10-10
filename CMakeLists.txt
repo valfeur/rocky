@@ -1,9 +1,20 @@
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.24)
 
 # Dependency selection must precede project(): the vcpkg toolchain installs the
 # manifest while project() initializes the compiler
 
+# rocky-lite: a fully offline configuration built only from CMake + a C++
+# compiler + the Vulkan SDK, with no vcpkg/Conan and a drastically reduced
+# dependency set (see ROCKY_LITE_SPEC.md and docs/ROCKY_LITE_NOTES.md).
+# ON by default; set to OFF to get the original vcpkg-oriented defaults
+# below (GDAL, MBTiles, HTTPS, Slughorn, Azure all enabled). ImGui stays
+# on in both configurations -- see the note below.
+option(ROCKY_LITE "Build the dependency-pruned, fully offline configuration" ON)
+
 # optional modules
+# NOTE: when ROCKY_LITE=ON, the defaults below are overridden further down
+# (after project()) rather than here, so each option's documented default
+# stays accurate for the ROCKY_LITE=OFF / upstream-compatible configuration.
 option(ROCKY_SUPPORTS_AZURE "Support Azure Maps (subscription required)" ON)
 option(ROCKY_SUPPORTS_BING "Support Bing Maps (subscription required)" OFF)
 option(ROCKY_SUPPORTS_CURL "Support HTTP with the CURL library" ON)
@@ -14,6 +25,41 @@ option(ROCKY_SUPPORTS_IMGUI "Support Dear ImGui and build ImGui-based demos" ON)
 option(ROCKY_SUPPORTS_MBTILES "Support MBTiles databases with extended spatial profile support (requires sqlite3, zlib)" ON)
 option(ROCKY_SUPPORTS_QT "Build Qt demos" OFF)
 option(ROCKY_SUPPORTS_SLUGHORN "Support Slughorn vector decals" ON)
+
+if(ROCKY_LITE)
+    # Force the lite-mode combination of the options above. FORCE is used
+    # deliberately: ROCKY_LITE=ON is meant to mean "fully lite" even if the
+    # cache already has the upstream defaults from a prior non-lite
+    # configure. To get GDAL/MBTiles/HTTPS/Slughorn/Azure back, configure
+    # with -DROCKY_LITE=OFF instead of fighting these.
+    #
+    # ImGui is deliberately left ON (not forced off): Label/Widget
+    # rendering (src/rocky/vsg/ecs/LabelSystem.cpp, WidgetSystem.cpp) is
+    # implemented entirely on top of ImGui with no non-ImGui path, so
+    # treating it as prunable the way GDAL/sqlite/curl are would silently
+    # remove a load-bearing rendering feature rather than an add-on. It's
+    # also small, MIT-licensed, and vendored the same way as everything
+    # else (third_party/imgui, see third_party/CMakeLists.txt), so keeping
+    # it costs nothing toward the offline/no-vcpkg goal.
+    set(ROCKY_SUPPORTS_AZURE OFF CACHE BOOL "" FORCE)
+    set(ROCKY_SUPPORTS_CURL OFF CACHE BOOL "" FORCE)
+    set(ROCKY_SUPPORTS_GDAL OFF CACHE BOOL "" FORCE)
+    set(ROCKY_SUPPORTS_HTTPLIB ON CACHE BOOL "" FORCE)
+    set(ROCKY_SUPPORTS_HTTPS OFF CACHE BOOL "" FORCE)
+    set(ROCKY_SUPPORTS_MBTILES OFF CACHE BOOL "" FORCE)
+    set(ROCKY_SUPPORTS_QT OFF CACHE BOOL "" FORCE)
+    set(ROCKY_SUPPORTS_SLUGHORN OFF CACHE BOOL "" FORCE)
+
+    # Vendored third-party targets (glm, spdlog, glslang, SPIRV, ...) are
+    # built from source as ordinary in-tree targets, not as IMPORTED
+    # targets from a find_package()-located install -- so Rocky's and
+    # VSG's own install(EXPORT ...) calls would otherwise fail at generate
+    # time demanding that every such dependency also be part of an export
+    # set. rocky-lite has no goal of producing a redistributable installed
+    # SDK (only of building and running the example), so skip install()
+    # processing entirely rather than solve that per dependency.
+    set(CMAKE_SKIP_INSTALL_RULES ON)
+endif()
 
 # whether to copy dependency DLLs (under windows, usually) to the installation destination
 option(ROCKY_INSTALL_VCPKG_DEPENDENCY_DLLS "Copy dependency DLLs from vcpkg to the install destination" OFF)
@@ -120,6 +166,14 @@ function(rocky_glob out_var)
     list(FILTER _items EXCLUDE REGEX "(^|/)\\.[^/]*$")
     set(${out_var} ${_items} PARENT_SCOPE)
 endfunction()
+
+# rocky-lite: vendored third-party dependencies, added before src/ so that
+# their FetchContent(SOURCE_DIR ... OVERRIDE_FIND_PACKAGE) redirects are in
+# place before any find_package() call below (or inside VSG/vsgXchange's
+# own CMakeLists.txt files) resolves them.
+if(ROCKY_LITE)
+    add_subdirectory(third_party)
+endif()
 
 # source code
 add_subdirectory(src)

@@ -1,0 +1,293 @@
+/* <editor-fold desc="MIT License">
+
+Copyright(c) 2018 Robert Osfield
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+</editor-fold> */
+
+#include <vsg/commands/CopyAndReleaseBuffer.h>
+#include <vsg/core/compare.h>
+#include <vsg/io/Logger.h>
+#include <vsg/state/BufferInfo.h>
+#include <vsg/vk/Context.h>
+
+using namespace vsg;
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// vsg::BufferInfo
+//
+BufferInfo::BufferInfo()
+{
+}
+
+BufferInfo::BufferInfo(Data* in_data) :
+    data(in_data)
+{
+}
+
+BufferInfo::BufferInfo(Buffer* in_buffer, VkDeviceSize in_offset, VkDeviceSize in_range, Data* in_data) :
+    buffer(in_buffer),
+    offset(in_offset),
+    range(in_range),
+    data(in_data)
+{
+}
+
+BufferInfo::~BufferInfo()
+{
+    release();
+}
+
+ref_ptr<Object> BufferInfo::clone(const CopyOp& copyop) const
+{
+    auto new_data = copyop(data);
+    if (new_data == data) return ref_ptr<Object>(const_cast<BufferInfo*>(this));
+
+    return BufferInfo::create(new_data);
+}
+
+int BufferInfo::compare(const Object& rhs_object) const
+{
+    int result = Object::compare(rhs_object);
+    if (result != 0) return result;
+
+    auto& rhs = static_cast<decltype(*this)>(rhs_object);
+
+    if (data != rhs.data && data && rhs.data)
+    {
+        if (data->dynamic() || rhs.data->dynamic())
+        {
+            if (data < rhs.data) return -1;
+            return 1; // from checks above it must be that data > rhs.data
+        }
+    }
+
+    if ((result = compare_pointer(data, rhs.data))) return result;
+
+    /// if one of less buffer is assigned treat as a match as data is the same, and we can reuse any BufferInfo that's been assigned.
+    if (!buffer || !rhs.buffer) return 0;
+
+    if ((result = compare_pointer(buffer, rhs.buffer))) return result;
+    if ((result = compare_value(offset, rhs.offset))) return result;
+    return compare_value(range, rhs.range);
+}
+
+void BufferInfo::take(BufferInfo& src)
+{
+    if (&src == this) return;
+
+    if (buffer && !parent)
+    {
+        bool identical = (buffer == src.buffer && offset == src.offset && range == src.range);
+
+        if (!identical)
+        {
+            // release entry into buffer.
+            buffer->release(offset, range);
+        }
+    }
+
+    // copy settings across
+    parent = src.parent;
+    buffer = src.buffer;
+    offset = src.offset;
+    range = src.range;
+
+    // reset the src BufferInfo
+    src.parent.reset();
+    src.buffer.reset();
+    src.offset = 0;
+    src.range = 0;
+}
+
+void BufferInfo::release()
+{
+    if (parent)
+    {
+        parent.reset();
+    }
+    else if (buffer)
+    {
+        buffer->release(offset, range);
+    }
+
+    buffer.reset();
+    offset = 0;
+    range = 0;
+}
+
+void BufferInfo::copyDataToBuffer()
+{
+    if (!buffer) return;
+
+    for (uint32_t deviceID = 0; deviceID < buffer->sizeVulkanData(); ++deviceID)
+    {
+        copyDataToBuffer(deviceID);
+    }
+}
+
+void BufferInfo::copyDataToBuffer(uint32_t deviceID)
+{
+    if (!buffer || !data) return;
+
+    DeviceMemory* dm = buffer->getDeviceMemory(deviceID);
+    if (dm)
+    {
+        if ((dm->getMemoryPropertyFlags() & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)
+        {
+            if (auto transferTask = dm->getDevice()->transferTask.ref_ptr())
+            {
+                // if data->dirty() hasn't been called since the last copy, assume it should have been done in call dirty on the data to ensure TransferTask copies the data.
+                if (!data->differentModifiedCount(copiedModifiedCounts[deviceID]))
+                {
+                    data->dirty();
+                }
+
+                transferTask->assign(BufferInfoList{ref_ptr<BufferInfo>(this)});
+            }
+            else
+            {
+                warn("BufferInfo::copyDataToBuffer() cannot copy data. DeviceMemory does not support direct memory mapping.");
+
+                // you can use dynamic data updates provided by vsg::TransferTask or alternatively, you can implement the following steps:
+                // 1. allocate staging buffer
+                // 2. copy to staging buffer
+                // 3. transfer from staging buffer to device local buffer - use CopyAndReleaseBuffer
+            }
+            return;
+        }
+
+        void* buffer_data;
+        VkResult result = dm->map(buffer->getMemoryOffset(deviceID) + offset, range, 0, &buffer_data);
+        if (result != 0)
+        {
+            warn("BufferInfo::copyDataToBuffer() cannot copy data. vkMapMemory(..) failed with result = ", result);
+            return;
+        }
+
+        char* ptr = reinterpret_cast<char*>(buffer_data);
+        std::memcpy(ptr, data->dataPointer(), data->dataSize());
+
+        dm->unmap();
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// vsg::copyDataToStagingBuffer
+//
+ref_ptr<BufferInfo> vsg::copyDataToStagingBuffer(Context& context, const Data* data)
+{
+    if (!data) return {};
+
+    VkDeviceSize imageTotalSize = data->dataSize();
+
+    VkDeviceSize alignment = std::max(VkDeviceSize(4), VkDeviceSize(data->valueSize()));
+    auto stagingBufferInfo = context.stagingMemoryBufferPools->reserveBuffer(imageTotalSize, alignment, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    stagingBufferInfo->data = const_cast<Data*>(data);
+
+    debug("stagingBufferInfo->buffer ", stagingBufferInfo->buffer.get(), ", ", stagingBufferInfo->offset, ", ", stagingBufferInfo->range, ")");
+
+    ref_ptr<Buffer> imageStagingBuffer(stagingBufferInfo->buffer);
+    ref_ptr<DeviceMemory> imageStagingMemory(imageStagingBuffer->getDeviceMemory(context.deviceID));
+
+    if (!imageStagingMemory) return {};
+
+    // copy data to staging memory
+    imageStagingMemory->copy(imageStagingBuffer->getMemoryOffset(context.deviceID) + stagingBufferInfo->offset, imageTotalSize, data->dataPointer());
+
+    debug("Creating imageStagingBuffer and memory size = ", imageTotalSize);
+
+    return stagingBufferInfo;
+}
+
+VkDeviceSize BufferInfo::computeDataSize() const
+{
+    return data ? data->dataSize() : 0;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// vsg::createBufferAndTransferData
+//
+bool vsg::createBufferAndTransferData(Context& context, const BufferInfoList& bufferInfoList, VkBufferUsageFlags usage, VkSharingMode sharingMode)
+{
+    return context.createBufferAndTransferData(bufferInfoList, usage, sharingMode);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//
+// vsg::createHostVisibleBuffer
+//
+BufferInfoList vsg::createHostVisibleBuffer(Device* device, const DataList& dataList, VkBufferUsageFlags usage, VkSharingMode sharingMode)
+{
+    if (dataList.empty()) return BufferInfoList();
+
+    BufferInfoList bufferInfoList;
+
+    VkDeviceSize alignment = 4;
+    if (usage == VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
+        alignment = device->getPhysicalDevice()->getProperties().limits.minUniformBufferOffsetAlignment;
+    else if (usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        alignment = device->getPhysicalDevice()->getProperties().limits.minStorageBufferOffsetAlignment;
+
+    debug("vsg::createHostVisibleBuffer(Device* device, const DataList& dataList, VkBufferUsageFlags usage, VkSharingMode sharingMode) usage = ", usage, ", alignment = ", alignment);
+
+    VkDeviceSize totalSize = 0;
+    VkDeviceSize offset = 0;
+    bufferInfoList.reserve(dataList.size());
+    for (auto& data : dataList)
+    {
+        bufferInfoList.push_back(BufferInfo::create(nullptr, offset, data->dataSize(), data));
+        VkDeviceSize endOfEntry = offset + data->dataSize();
+        offset = (alignment == 1 || (endOfEntry % alignment) == 0) ? endOfEntry : ((endOfEntry / alignment) + 1) * alignment;
+    }
+
+    totalSize = bufferInfoList.back()->offset + bufferInfoList.back()->range;
+
+    ref_ptr<Buffer> buffer = vsg::createBufferAndMemory(device, totalSize, usage, sharingMode, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    for (const auto& bufferData : bufferInfoList)
+    {
+        bufferData->buffer = buffer;
+    }
+
+    return bufferInfoList;
+}
+
+void vsg::copyDataListToBuffers(Device* device, BufferInfoList& bufferInfoList)
+{
+    for (auto& bufferData : bufferInfoList)
+    {
+        bufferData->copyDataToBuffer(device->deviceID);
+    }
+}
+
+void vsg::assignVulkanArrayData(uint32_t deviceID, const BufferInfoList& arrays, VulkanArrayData& vkd)
+{
+    //    info("vsg::assignVulkanArrayData(deviceID = ", deviceID, ", arrays.size() = ", arrays.size(), " vkd.vkBuffers.size() = ", vkd.vkBuffers.size(), ", &vkd ", &vkd);
+    vkd.vkBuffers.resize(arrays.size());
+    vkd.offsets.resize(arrays.size());
+
+    for (size_t i = 0; i < arrays.size(); ++i)
+    {
+        const auto& bufferInfo = arrays[i];
+        if (bufferInfo->buffer)
+        {
+            vkd.vkBuffers[i] = bufferInfo->buffer->vk(deviceID);
+            vkd.offsets[i] = bufferInfo->offset;
+        }
+        else
+        {
+            // error, no buffer to assign
+            vkd.vkBuffers[i] = 0;
+            vkd.offsets[i] = 0;
+        }
+    }
+}

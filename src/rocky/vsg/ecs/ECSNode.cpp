@@ -258,8 +258,8 @@ ECSNode::ECSNode(Registry& reg, bool addDefaultSystems) :
         add(MeshSystemNode::create(registry));
         add(LineSystemNode::create(registry));
         add(PointSystemNode::create(registry));
-        add(LabelSystem::create(registry));
 #ifdef ROCKY_HAS_IMGUI
+        add(LabelSystem::create(registry));
         add(WidgetSystemNode::create(registry));
 #endif
     }

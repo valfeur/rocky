@@ -207,6 +207,20 @@ if(ROCKY_RENDERER_VSG)
             vsg/ecs/SlugSystem.cpp)
     endif()
 
+    if(NOT ImGui_FOUND)
+        # LabelSystem renders Label/LabelStyle entities as ImGui windows and
+        # has no non-ImGui implementation (unlike WidgetSystem, which is
+        # already correctly guarded in ECSNode.cpp) -- exclude it the same
+        # way when ImGui isn't available, rather than leaving an unguarded
+        # hard ImGui dependency compiled in. The Label/LabelStyle ECS
+        # *components* themselves (ecs/Label.h) are plain data and have no
+        # ImGui dependency, so they remain available either way.
+        remove_items(HEADERS_VSG_ECS
+            vsg/ecs/LabelSystem.h)
+        remove_items(SOURCES_VSG_ECS
+            vsg/ecs/LabelSystem.cpp)
+    endif()
+
     if(ImGui_FOUND)
         rocky_glob(HEADERS_VSG_IMGUI vsg/imgui/*.h)
         rocky_glob(SOURCES_VSG_IMGUI vsg/imgui/*.cpp)
