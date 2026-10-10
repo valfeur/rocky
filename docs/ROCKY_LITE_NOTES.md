@@ -756,3 +756,205 @@ creation succeeds, no crash, matching the "must always run with zero
 arguments and zero network" requirement) after the `app.realize()` fix
 above. The access violation that preceded the fix is confirmed gone, not
 just theorized away by reading the diff.
+
+## Phase 5 addendum — visual validation, a real engine bug, and a context-driven redesign
+
+Phase 5's own "done" state above was validated by confirming the process
+didn't crash and logged the expected messages -- **not by actually
+looking at a screenshot**. The very first time anyone did (prompted by
+the user reporting "the visualisation is all light blue, no earth nor
+model"), it turned up a real, reproducible rendering bug and several
+genuine usability problems that no amount of log-reading would have
+caught. This section is a record of that investigation, in the order it
+actually happened, because the dead ends are as informative as the fixes.
+
+### Screenshotting a native Vulkan window
+
+Nothing in this fork's toolset could screenshot a native (non-browser)
+window directly. The working recipe, used throughout this session:
+PowerShell's `System.Drawing` (`Bitmap` + `Graphics.CopyFromScreen`) to
+capture pixels, and `user32.dll`'s `SetWindowPos` (via a small inline C#
+`Add-Type` block) with `HWND_TOPMOST` to force the target window above
+whatever else is on screen first -- `ShowWindow(SW_MAXIMIZE)` alone
+wasn't reliable on a multi-monitor setup, and `$p.MainWindowHandle` is
+sometimes still `0` immediately after `Start-Process` returns (the
+window hasn't been created yet), so every capture needs a `$p.Refresh()`
+retry loop before trusting the handle.
+
+### The actual bug: camera framing, not rendering
+
+The first screenshot showed a solid, edge-to-edge cyan fill with no
+horizon, no globe silhouette, nothing. Comparing against `rocky_simple`'s
+own default (far) camera -- which *did* show a recognizable round globe
+silhouette against black space, just flat-colored since it has no
+working imagery layer either (`ROCKY_LITE` disables TLS, so
+`readymap.org`'s hardcoded `https://` URL fails exactly as Phase 3
+documented) -- proved terrain rendering itself was never broken.
+
+The real cause was `main.cpp`'s initial `Viewpoint`: `range =
+radius_m*6` (120 km) with `pitch = -30`. At the default ~30-degree
+vertical FOV (half-FOV 15 degrees), any pitch steeper than about -15
+degrees points the *entire* frustum below the local horizontal -- there
+is no sky in frame at all, so the view fills edge-to-edge with the
+terrain's flat, untextured base color and reads as a blank wall of color
+instead of "a globe." Separately, the 15 m procedural airframe was
+hopelessly sub-pixel at a 120 km framing distance regardless. Fixed by
+shallowing the pitch (enough to show a horizon/sky band) and, later,
+tethering the camera close to the aircraft to actually see it -- both
+superseded by the final top-down tactical view described below.
+
+### Disproving a specific regression theory: GDAL-disabled imagery rendering
+
+The user recalled a prior build (unrelated to this fork) where disabling
+GDAL broke TMS/XYZ image-layer rendering even though that path is
+documented as GDAL-independent. Rather than assume that was (or wasn't)
+happening here, it was tested directly: a small set of real OSM tiles
+fetched once to a local directory, then a real plain-`http://` public
+tile server (`a.tile.opentopomap.org` -- found because OSM's own
+`tile.openstreetmap.org` 301-redirects every plain-`http://` request to
+`https://`, which fails outright under `ROCKY_LITE`'s disabled TLS; this
+one serves `200` directly over plain HTTP, confirmed with `curl`) wired
+through the example's existing `--tiles` flag. **Both rendered correctly
+end to end** -- real street/terrain imagery, correctly projected,
+fetched over a genuine live network connection. This conclusively rules
+out a GDAL-disabled TMS rendering regression in this build; whatever the
+user remembered was either a different codebase or a different symptom.
+(A third URL the user supplied afterward,
+`services.arcgisonline.com/.../World_Imagery/MapServer/tile/{z}/{y}/{x}.png`,
+also 301-redirects to `https://` and so also fails under this build --
+same root cause as `readymap.org`, not a new issue. Note its tile
+template order is `{z}/{y}/{x}`, not the usual `{z}/{x}/{y}}`; the
+existing `--tiles` substitution is purely textual and handles either
+order with no code changes.)
+
+### The aircraft mesh was never actually invisible
+
+Once the camera was fixed, the aircraft and radar beam still didn't show
+up in an orbit-overview framing. Extensive instrumentation (temporary
+debug logging added to and then removed from `MeshSystem.cpp`'s
+`renderEntity` lambda, confirming every CPU-side eligibility/culling
+check passed and the entity reached the draw list every frame; Vulkan
+validation layers, which found nothing new beyond the pre-existing,
+already-documented Phase 4 `WRITE_AFTER_WRITE` hazard) all said the mesh
+was rendering correctly. The actual problem, found by brute-force
+elimination: rendering a deliberately huge, saturated magenta version of
+the airframe made an airframe that had been correctly rendering all
+along finally visible. Gunmetal gray (the original "realistic" choice)
+reads as near-invisible against generic terrain; a follow-up vivid
+*orange* then turned out to blend into OpenTopoMap's own orange/red road
+coloring just as badly. **Magenta/pink is the one color that reliably
+never occurs in real cartography** -- real tactical displays use a
+similarly never-naturally-occurring color for tracked contacts for
+exactly this reason, which is now documented in `SimContext.h` as the
+default `Track` and `Waypoint` colors (cyan for waypoints, so the two
+categories don't collide). The same camouflage mechanism explained a
+waypoint marker that seemed to not render: it used `StockColor::White`,
+which vanishes over any town/city basemap tile the same way a white or
+gray track icon vanishes over generic terrain.
+
+Separately, true-to-life scale (a 15 m airframe) is sub-pixel at any
+camera distance wide enough to show a useful tactical-overview area, no
+matter the color. The fix is Rocky's own `PixelScale` ECS component
+(`minPixels`/`maxPixels`, found by reading `TransformDetail.cpp`'s
+existing pixel-scale-clamping code, already used elsewhere for
+markers/icons) rather than the hand-rolled, manually-sampled
+camera-distance scale factor this example started with -- `PixelScale`
+is computed from the live camera projection every frame and needed no
+new plumbing through `main.cpp`'s frame loop at all.
+
+### A real engine bug: `MeshStyle::transparencyBin`
+
+The radar beam (an FOV cone) never rendered under *any* camera framing,
+color, or distance -- including once the aircraft's own camouflage
+lesson was applied. This one was a genuine rendering bug, isolated by
+direct elimination of the style flags one at a time:
+
+- A deliberately opaque, bright-red, `writeDepth = true`,
+  `transparencyBin = false` wireframe version of the exact same cone
+  geometry **rendered perfectly** -- correct position, correct
+  orientation, correct size, a clearly visible wedge extending from the
+  aircraft.
+- Reverting *only* `transparencyBin` back to `true` (keeping
+  `writeDepth = false`, full-alpha color) made it **render nothing at
+  all** -- not faint, not thin, completely absent, including the
+  wireframe outline's opaque lines, which rules out an alpha/contrast
+  explanation.
+- Keeping `writeDepth = false` and changing only `transparencyBin` to
+  `false` again **rendered correctly**.
+
+`MeshStyle::transparencyBin` routes through the `DepthSorted`-bin path
+in `StyleRenderer<T>::traverse()` (`src/rocky/vsg/ecs/ECSNode.h`) instead
+of the normal immediate-draw path. That path produces zero visible
+output for this geometry, regardless of color, alpha, or depth-write
+settings -- a real, reproducible bug, confirmed by direct empirical
+isolation rather than by reading the `DepthSorted`/bin-assembly code
+(which wasn't dug into further; the mechanism was identified, not root-
+caused at the VSG level). It has nothing to do with `ROCKY_LITE`, PROJ,
+GDAL, or anything else in this fork's actual scope -- it would reproduce
+identically in the full vcpkg/non-lite build. **Worked around here by
+not using `transparencyBin`** for the field-of-view cone (`SceneSync.cpp`,
+`createFovEntity`): a single cone doesn't need correct back-to-front
+depth sorting against *other* translucent objects, which is the only
+thing that flag is for, so plain (unsorted) alpha blending is strictly
+sufficient and visibly correct. Flagged separately (not fixed here) for
+whoever next needs `transparencyBin` for something that actually
+requires sorted translucency.
+
+### Redesign: a `SimContext`, so a third-party app owns the data, not the ECS
+
+The user asked for a clean integration surface: a single-file, plain-data
+description of everything this visualization can draw, so an external
+application only has to populate that struct (from its own data model)
+and call one function -- no ECS, no Rocky types, no rendering concepts
+leaking into the integration boundary. This replaced `Aircraft.*` and
+`RadarBeam.*` entirely with three pieces, deliberately kept separate:
+
+- **`SimContext.h`** -- the schema itself: `Track` (a tracked, moving
+  platform -- position/attitude/label/optional model path/color),
+  `Trajectory` (an ordered point list, paired to a track by id),
+  `Waypoint` (a static reference point), `FieldOfView` (a sensor cone
+  attached to a track by id, generalizing what was a hardcoded "radar
+  beam"), and `Plot` (a numerous, short-lived raw detection, batched for
+  rendering efficiency rather than id-tracked individually like the
+  other four categories). Every object is matched across frames by a
+  `std::string id` -- deliberately not a Rocky or ECS type, so the file
+  has zero dependencies beyond the STL and reads top-to-bottom as a plain
+  schema, easy to hand to an LLM for adaptation to a specific existing
+  data model's field names and units.
+- **`SceneSync.h`/`.cpp`** -- the *only* code in this example that
+  touches the ECS. Owns nothing but `id -> entt::entity` maps per
+  category; `sync(context)` diffs the incoming vectors against what it
+  already created, and creates/updates/removes entities accordingly.
+  Tracks, trajectories, waypoints, and fields of view get one entity (or
+  small entity group) each, matched by id; plots are rebuilt wholesale
+  into one shared `Point` entity every call, since they're expected to
+  be numerous and short-lived rather than individually identity-tracked.
+- **`DemoScenario.h`/`.cpp`** -- stands in for a real application's data
+  source. Computes the same scripted circular orbit Phase 5 originally
+  had (unchanged math), but instead of touching rendering at all, it
+  only *writes* a `Track`, a `Trajectory`, a `FieldOfView`, a `Waypoint`
+  ("BASE", at the orbit center), and a handful of jittered `Plot`s
+  (simulated raw detections near the track, refreshed every couple of
+  seconds) into a `SimContext` each frame -- exercising every category
+  the schema defines, which the original Phase 5 example never did
+  (there was no waypoint or plot concept at all before this).
+
+`main.cpp`'s frame loop is now exactly `scenario.update(t, context);
+sceneSync.sync(context);` -- the ECS is no longer visible at that level
+at all.
+
+**The default camera is now a top-down (nadir, `pitch = -90`) tactical
+view**, per the user's explicit request that a tactical display should
+default to looking straight down rather than the oblique "flying over
+terrain" angle every earlier iteration of this example used.
+
+**Validated by actually building and running the final result**, not
+just compiling: `rocky_lite_tactical --tiles
+http://a.tile.opentopomap.org/{z}/{x}/{y}.png` shows, together, in one
+screenshot: real top-down tile imagery with correct geography, a
+magenta track icon with a small label offset above it (not centered on
+top of it, which was its own earlier bug -- `LabelStyle::textOffset`),
+a yellow trajectory trail, a clearly visible translucent green
+field-of-view cone extending from the track, and a cyan waypoint marker
+with its label. Every `SimContext` category renders correctly together
+against real network imagery.

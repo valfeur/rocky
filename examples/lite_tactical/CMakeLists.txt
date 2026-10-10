@@ -2,10 +2,11 @@ set(APP_NAME rocky_lite_tactical)
 
 add_executable(${APP_NAME}
     main.cpp
-    Aircraft.h
-    Aircraft.cpp
-    RadarBeam.h
-    RadarBeam.cpp
+    SimContext.h
+    SceneSync.h
+    SceneSync.cpp
+    DemoScenario.h
+    DemoScenario.cpp
     ModelLoader.h
     ModelLoader.cpp
     Primitives.h
