@@ -586,3 +586,76 @@ Actual new work, in order of how it was found:
 all 98 test cases / 5634 assertions pass, including the 5 new ones and
 the 3 that previously failed in Phase 2's lite run (`"TMS"`, `"IO > HTTP"`,
 `"Earth File"` all now pass or skip cleanly with an explanatory warning).
+
+## Phase 4 — Shaders and windowing (done, no code changes)
+
+Everything this phase asks for was already true as of Phase 0/Phase 1 --
+this phase is a validation checkpoint, not new work, and it needed a real
+GPU/window to actually check rather than just reading code:
+
+- **glslang / shader compilation**: Phase 0 already confirmed Rocky
+  compiles GLSL to SPIR-V at *runtime* via VSG's own
+  `vsg::ShaderCompileSettings` machinery (linking glslang as a library),
+  never via the `glslangValidator` CLI tool. Phase 1 vendored glslang
+  (library only, `ENABLE_GLSLANG_BINARIES=OFF`, no CLI tool even built).
+  Nothing left to do here except prove it actually works at runtime, not
+  just that the library links.
+- **Windowing**: Phase 0 confirmed VSG's native Win32/XCB windowing, no
+  GLFW/SDL anywhere in the tree. The user asked about adding GLFW instead
+  for its cross-platform story; evaluated and declined -- the crash
+  investigated below turned out to be unrelated to windowing entirely
+  (the window opened fine in every run), and VSG has no GLFW backend to
+  plug into in the first place -- adding one would mean writing a new
+  `vsg::Window` subclass bridging GLFW's surface creation to VSG's
+  windowing abstraction from scratch, a real integration project, not a
+  drop-in swap, for no benefit toward anything actually broken.
+- **ImGui**: already decided and vendored in Phase 1 (kept ON, not put
+  behind a default-OFF option as the spec assumed -- see Phase 1's notes
+  above for why).
+
+**Validated by actually building and running a demo app with a real
+window and a real GPU** (NVIDIA GeForce RTX 3060 Ti, driver's own Vulkan
+ICD), not just by reading the code: built `rocky_simple` under
+`ROCKY_LITE=ON` and ran it with `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`
+to get clear diagnostics rather than opaque driver crashes.
+
+- `rocky_simple --simple` (which goes through `rocky::Application`, the
+  normal/supported setup path): window opens, Vulkan device creation
+  succeeds, terrain shaders compile via the vendored glslang with no
+  errors, and the app keeps running. The hardcoded `readymap.org` imagery
+  layer fails to open (it's `https://`, and `ROCKY_LITE` disables TLS, per
+  Phase 1/3) and logs exactly the Phase 3 message --
+  `"Failed to open at least one layer... TLS not supported in rocky-lite"`
+  -- confirming that error path end to end in a real run, not just a
+  unit test. This is Phase 4's actual pass condition, confirmed.
+- `rocky_simple --no-app` (which hand-builds the VSG scene graph, skipping
+  `rocky::Application`) reliably **crashes** (access violation inside the
+  NVIDIA driver's Vulkan ICD, `nvoglv64.dll`). With validation layers
+  enabled, the real cause is clear and has nothing to do with lite,
+  shaders-at-runtime, or windowing: `ROCKY_HAS_DECALS` and
+  `ROCKY_HAS_FRUSTUM_GRID` are unconditional, always-on shader features
+  (literal `#define`s in `rocky.defines.h.glsl` and `Application.cpp`,
+  not configurable), so every terrain shader always declares descriptor
+  bindings for them (`u_renderParams`, `b_frustums`, `FrustumGridParams`,
+  `b_decals`, `b_decalTiles`, Set 1 bindings 10-14) and uses
+  `GL_EXT_nonuniform_qualifier` unconditionally for decal texture array
+  indexing. Only `rocky::Application`'s constructor actually creates
+  `DecalSystemNode`/`FrustumGridSystemNode` and wires the matching
+  descriptor-set-layout bindings and device feature
+  (`shaderSampledImageArrayNonUniformIndexing`) to go with them.
+  `no_app()` builds everything by hand and skips that step entirely, so
+  the shader and the pipeline layout disagree about Set 1's contents --
+  undefined behavior that happens to crash this driver. **This is a
+  pre-existing gap in that one demo code path, not a lite-specific bug**:
+  it would crash identically in the full vcpkg/non-lite build, since none
+  of `ROCKY_HAS_DECALS`/`ROCKY_HAS_FRUSTUM_GRID`/`rocky::Application`'s
+  setup is touched by anything in this fork. Not fixed here -- it's
+  outside rocky-lite's dependency-pruning scope -- but flagged separately
+  since it's a real, reproducible crash in Rocky's own example code.
+
+One unrelated, pre-existing observation from the same `--simple` run,
+also not a lite issue: Vulkan validation reports repeated
+`WRITE_AFTER_WRITE` hazards on a buffer copy during startup (missing
+synchronization between two `vkCmdCopyBuffer` calls). Cosmetic in this
+run (the app keeps going), but worth someone's attention separately --
+also unrelated to anything in this fork.
