@@ -636,6 +636,14 @@ namespace
 
     Result<HTTPResponse> http_get(const HTTPRequest& request, const IOOptions& io)
     {
+        if (!URI::supportsHTTPS() && startsWith(toLower(request.url), "https:"))
+        {
+            // Give a clear, specific reason instead of letting the request
+            // fail deep inside the TLS handshake (or a redirect to https)
+            // with a generic/confusing low-level error.
+            return Failure(Failure::ServiceUnavailable, "TLS not supported in rocky-lite");
+        }
+
 #if defined(ROCKY_HAS_HTTPLIB)
         return http_get_httplib(request, io);
 #elif defined(ROCKY_HAS_CURL)

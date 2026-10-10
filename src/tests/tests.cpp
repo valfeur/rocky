@@ -2811,7 +2811,11 @@ TEST_CASE("TMS")
     auto layer = TMSImageLayer::create();
     layer->uri = "https://readymap.org/readymap/tiles/1.0.0/7/";
     auto s = layer->open({});
-    CHECK((s.ok() || s.error().type == Failure::ResourceUnavailable));
+    // ResourceUnavailable: couldn't reach the server (offline/network-less environment).
+    // ServiceUnavailable: this is an https:// URL and ROCKY_LITE has no TLS support
+    // (ROCKY_SUPPORTS_HTTPS=OFF) -- see URI.cpp's http_get(), which fails this
+    // deliberately and immediately with a clear message rather than attempting it.
+    CHECK((s.ok() || s.error().type == Failure::ResourceUnavailable || s.error().type == Failure::ServiceUnavailable));
 }
 
 #ifdef ROCKY_HAS_PROJ
@@ -3735,6 +3739,16 @@ TEST_CASE("IO")
     {
         URI uri("http://readymap.org/readymap/tiles/1.0.0/7/");
         auto r = uri.read(IOOptions());
+
+        // readymap.org 301-redirects plain http:// to https://; without TLS
+        // support (ROCKY_SUPPORTS_HTTPS=OFF) that's an expected, graceful
+        // failure, not a bug -- skip rather than asserting success.
+        if (!URI::supportsHTTPS() && r.failed() && r.error().type == Failure::ServiceUnavailable)
+        {
+            WARN("Skipping: " << uri.full() << " redirects to https:// and TLS is not supported here: " << r.error().message);
+            return;
+        }
+
         CHECKED_IF(r.ok())
         {
             CHECK(r.value().content.type == "text/xml");
@@ -3806,6 +3820,16 @@ TEST_CASE("Earth File")
     std::string earthFile = "https://raw.githubusercontent.com/gwaldron/osgearth/master/tests/readymap.earth";
     EarthFileImporter importer;
     auto result = importer.read(earthFile, {});
+
+    // This is an https:// URL; without TLS support (ROCKY_SUPPORTS_HTTPS=OFF)
+    // that's an expected, graceful failure, not a bug -- skip rather than
+    // asserting success.
+    if (!URI::supportsHTTPS() && result.failed() && result.error().type == Failure::ServiceUnavailable)
+    {
+        WARN("Skipping: " << earthFile << " requires https:// and TLS is not supported here: " << result.error().message);
+        return;
+    }
+
     CHECKED_IF(result.ok())
     {
         auto contextSingleton = VSGContextFactory::create(nullptr);

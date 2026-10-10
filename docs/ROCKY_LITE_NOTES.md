@@ -488,3 +488,101 @@ Phase 3 (HTTP and tile sources), where `EarthFileImporter`/the `TMS`
 driver's own HTTPS-availability handling would be the natural place to
 fix the first two, and the loopback case deserves a quick look in
 isolation.
+
+## Phase 3 — HTTP and tile sources (done)
+
+Phase 0 and Phase 1 had already done most of this phase's nominal work
+without anyone intending to: the cpp-httplib backend behind `URI.cpp`'s
+existing dual-backend abstraction already existed upstream (just OFF by
+default; Phase 1 flipped `ROCKY_SUPPORTS_HTTPLIB`/`ROCKY_SUPPORTS_CURL`),
+`TMSImageLayer`'s existing "XYZ" mode (an explicit `profile` skips the
+TMS-manifest fetch entirely) plus `URI::read()`'s existing
+`std::filesystem::exists()`-first check already make a **plain local
+directory of `{z}/{x}/{y}.png` tiles** work with zero code changes and
+zero network, and `ElevationLayer`'s existing `Encoding` enum
+(`SingleChannel`/`MapboxRGB`/`TerrariumRGB`) already implements
+Terrain-RGB-style elevation decoding exactly as spec section 3 describes.
+There is still no disk tile cache (Phase 0 was right -- nothing to
+disable). No WMS/WMTS/ArcGIS layer classes exist in this codebase to drop
+either (this modern Rocky never had them; only GDAL/MBTiles/TMS/Azure/Bing
+layers exist, and Azure/Bing are already their own guarded options).
+
+Actual new work, in order of how it was found:
+
+1. **A clear "TLS not supported" error.** `URI.cpp`'s `http_get()` now
+   checks `!URI::supportsHTTPS() && startsWith(url, "https:")` up front
+   and fails immediately with `"TLS not supported in rocky-lite"`,
+   instead of letting the request fail deep inside httplib with a
+   generic (if not wrong) message. httplib itself already produces a
+   reasonably clear `"SSL connection failed"` when a plain `http://`
+   request's 301 redirect target is `https://` and
+   `CPPHTTPLIB_OPENSSL_SUPPORT` isn't defined (confirmed by reading
+   `third_party/cpp-httplib/httplib.h`'s redirect-handling code directly
+   -- it's a deliberate upfront check inside httplib too, not a garbled
+   TLS-handshake-over-plain-TCP failure as initially suspected) -- that
+   path was left as-is since it was already clear enough, and the new
+   check only covers the (more common, more directly spec-relevant) case
+   of a URL that's `https://` from the start.
+
+2. **Found and fixed a real bug this surfaced: `TMS::Driver::read()`
+   appended a `?mapbox=true` query-string hint to *every* Mapbox-RGB
+   tile request, including local file paths.** This broke local-directory
+   Terrain-RGB elevation tiles outright -- `.../0/0/0.png?mapbox=true`
+   doesn't exist as a file, so every local elevation tile request failed
+   with `ResourceUnavailable`, silently (no loud error, just a failed
+   tile -- a real violation of the spec's own "fail loudly, never return
+   garbage" principle, except here it was "fail opaquely" rather than
+   "silently return garbage," which is a lesser but still real problem).
+   Fixed by only appending the hint when `imageURI.isRemote()` -- the
+   query string is meaningless for a local path and only a remote TMS
+   server could ever act on it. Found by actually running a local
+   Terrain-RGB elevation layer end-to-end, not by reading the diff.
+
+3. **Three pre-existing tests assumed HTTPS was always available**
+   (`"TMS"`, `"IO > HTTP"`, `"Earth File"` in `tests.cpp`) and hit real
+   external HTTPS-only (or https-redirecting) domains unconditionally.
+   `"TMS"` now also accepts `Failure::ServiceUnavailable` (the error type
+   the new TLS check and httplib's redirect handling both actually
+   return) alongside the `ResourceUnavailable` it already tolerated.
+   `"IO > HTTP"` and `"Earth File"` now check `URI::supportsHTTPS()` +
+   the specific failure type and skip with a `WARN` (matching the
+   existing, adjacent `"IO > HTTPS"` test's own self-skip pattern) rather
+   than asserting success unconditionally.
+
+4. **New test file `src/tests/tests_lite_tiles.cpp`**, added to prove the
+   actual Phase 3 deliverable end to end -- not just "compiles with
+   GDAL/PROJ/curl off" -- across five cases:
+   - a local-directory XYZ image tile, decoded via the real vsgXchange
+     image pipeline, zero network;
+   - a local-directory Terrain-RGB (MapboxRGB) elevation tile, decoded
+     via `ElevationLayer::decodeRGB` and read back through
+     `GeoHeightfield`, zero network (this is the test that caught bug #2
+     above);
+   - a real plain-`http://` local tile server, using `httplib::Server`
+     (the same vendored cpp-httplib the lite build links against) to
+     serve a tile over an actual loopback TCP connection, not a local
+     filesystem path;
+   - a missing tile over that same local http server failing gracefully
+     (not crashing, not hanging);
+   - an `https://` tile URI failing with exactly the new clear message.
+
+   Two vendoring notes from writing this file: `stb_image_write.h` was
+   added to `third_party/stb` (same pinned commit as `stb_image.h`) purely
+   to generate tiny PNG fixtures for the test -- it's `#include`d with
+   `STBIW_STATIC` defined, because vsgXchange vendors its own internal
+   copy with external linkage (`src/stbi/stbi.cpp`), and without
+   `STBIW_STATIC` a non-lite configuration that statically links
+   vsgXchange would hit a duplicate-symbol link error. Also,
+   `Image::data<T>(s, t, layer)` is a single-component-per-pixel
+   accessor (`[layer*w*h + t*w + s]`, no `numComponents()` factored in)
+   -- not a raw multi-byte-pixel accessor as its name suggests; the test
+   initially misused it to "bypass" sRGB linearization and got
+   nonsensical channel-shifted values back. Fixed by using
+   `Image::viewAs()` (the same technique `ElevationLayer::decodeRGB`
+   already uses) to reinterpret an SRGB-tagged format as UNORM before
+   reading a pixel, rather than reaching for raw pointer arithmetic.
+
+**Validated by actually running the full suite**, not just compiling:
+all 98 test cases / 5634 assertions pass, including the 5 new ones and
+the 3 that previously failed in Phase 2's lite run (`"TMS"`, `"IO > HTTP"`,
+`"Earth File"` all now pass or skip cleanly with an explanatory warning).

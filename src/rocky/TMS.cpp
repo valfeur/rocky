@@ -672,7 +672,10 @@ TMS::Driver::read(const TileKey& key, bool invertY, bool isMapboxRGB, const URI:
 
         imageURI = URI(tileMap.getURI(key, y_inverted), context);
 
-        if (!imageURI.empty() && isMapboxRGB)
+        // The "?mapbox=true" query hint is for remote servers that vary their
+        // response based on it; it's meaningless (and breaks lookup outright)
+        // for a local file path, which has no concept of a query string.
+        if (!imageURI.empty() && isMapboxRGB && imageURI.isRemote())
         {
             if (imageURI.full().find('?') == std::string::npos)
                 imageURI = URI(imageURI.full() + "?mapbox=true", context);
