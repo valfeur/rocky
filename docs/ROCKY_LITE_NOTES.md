@@ -659,3 +659,100 @@ also not a lite issue: Vulkan validation reports repeated
 synchronization between two `vkCmdCopyBuffer` calls). Cosmetic in this
 run (the app keeps going), but worth someone's attention separately --
 also unrelated to anything in this fork.
+
+## Phase 5 — Reference example (done)
+
+New target `rocky_lite_tactical` under `examples/lite_tactical/`: a bare
+WGS84 globe, an aircraft flying a scripted circular orbit (banked turn,
+heading/pitch/roll all derived from the orbit's own speed/radius, not
+hand-tuned), a translucent radar beam cone fixed to its nose, and a fading
+ground-track trail -- the spec section 5 reference app, built and run
+against the lite stack with zero network and zero bundled data.
+
+**Procedural vs. real aircraft geometry.** Built a small procedural
+airframe (box fuselage + wing/tail boxes + engine cylinders, see
+`Primitives.h`) first, as a guaranteed-always-available fallback with no
+external assets. The user then asked to use real downloaded models (e.g.
+from the Tacview community model repository) instead where practical.
+Investigated that repository directly: its models have no textures
+bundled (material/UV data references textures that aren't in the repo)
+and the repo's own licensing terms for redistribution were ambiguous
+enough that fetching and committing one into this fork wasn't
+appropriate. The user clarified the actual requirement: they will place a
+model file manually in their own offline environment, so redistribution
+licensing is a non-issue -- the code just needs to *accept* a user-supplied
+model, not ship one. Resolved by keeping the procedural airframe as the
+zero-asset default and adding `ModelLoader`/`--model <path>` as an
+opt-in override (first `*.obj` under `models/` is used automatically if
+present, matching `models/README.md`, which documents this and is the
+only thing committed under that directory -- see the `.gitignore` entry
+excluding actual model files). The radar beam stays procedural
+unconditionally (a geometric cone derived from azimuth/elevation/range,
+not a modeled object), since the user's redirection was specifically
+about the aircraft.
+
+**`assimp` vs. `tinyobjloader`.** The user initially suggested vendoring
+`assimp` for model loading, believing it to be header-only. It isn't --
+upstream `assimp` is a large compiled library (its own importer backends,
+`zlib`, etc.), which would have reintroduced exactly the kind of heavy
+transitive dependency this whole effort removes. Used `tinyobjloader`
+instead (vendored in `third_party/tinyobjloader`, MIT, genuinely a single
+header in the STB style), which covers the one format actually
+needed (`.obj`) with no extra link-time dependencies. See
+`third_party/VERSIONS.md` for the pinned commit.
+
+**`Geometry` namespace collision.** The example's own geometry-building
+helpers were originally in a `namespace Geometry`, which collided
+(`error C2872: 'Geometry': symbole ambigu`) with `rocky::Geometry` once
+pulled in through `using namespace ROCKY_NAMESPACE`. Renamed to
+`Primitives` (both the namespace and `Primitives.h`'s filename) -- not a
+lite-specific issue, just a naming clash local to this new example code.
+
+**`CMAKE_DISABLE_FIND_PACKAGE_vsg` breaking incremental reconfigures,
+found again.** Adding `examples/` as a new subdirectory triggered CMake's
+"out of date, re-run" path on an *already-configured* build tree, which
+re-hit the exact stale-cache problem Phase 1 already fixed once
+(`third_party/CMakeLists.txt`'s `unset(CMAKE_DISABLE_FIND_PACKAGE_<pkg>
+CACHE)` loop): `find_package for module vsg called with REQUIRED, but
+CMAKE_DISABLE_FIND_PACKAGE_vsg is enabled`. The existing fix was already
+in place and already correct -- this wasn't a new bug, just confirmation
+that the fix genuinely covers *any* later incremental reconfigure
+(adding a new subdirectory, not just re-running cmake on the same
+CMakeLists.txt), not only the one case it was originally found under.
+
+**`app.realize()` gotcha.** `main.cpp` originally read the default
+window's view (`app.display.window(0).view(0).vsgView`, to seed the
+camera's initial viewpoint via `MapManipulator`) immediately after
+constructing the scene, before the first call to `app.frame()`. This
+crashed with an access violation inside `rocky.dll`, confirmed via
+`Get-WinEvent`'s Application Error log rather than relying on the
+process's own exit code (unreliable for a native GUI crash under
+PowerShell's `Start-Process`). Root cause: `rocky::Application` creates
+its default window **lazily**, on the first `frame()` call, unless
+`realize()` is called explicitly first -- accessing `window(0)` any
+earlier dereferences a window that doesn't exist yet. Fixed by calling
+`app.realize()` once, right before that camera setup, which is exactly
+what `Application`'s own doc comment says to do in this situation. Not a
+lite-specific bug -- it would reproduce identically in the full
+vcpkg/non-lite build -- just a real gotcha in `Application`'s API that
+this new example's startup sequence happened to hit.
+
+**Imagery stays out of scope for this example, by design, using the
+existing `TMSImageLayer`/XYZ path from Phase 3 as-is.** `--tiles <url>`
+takes a plain XYZ URL template (`{z}/{x}/{y}.png`) and hands it straight
+to `TMSImageLayer` with an explicit `spherical-mercator` profile -- this
+already works, unmodified, against either a real HTTP XYZ tile server or
+a local directory, with no new code needed here. No throwaway local tile
+server was stood up to "test" this path end-to-end for its own sake: the
+underlying machinery was already proven in Phase 3's dedicated test file
+(`tests_lite_tiles.cpp`), and the user's actual deployment target is a
+real (if simple) XYZ tileserver that will be available in their offline
+environment -- not a thing this fork needs to simulate.
+
+**Validated by actually building and running the example**, not just
+compiling: a Release build of `rocky_lite_tactical` under
+`ROCKY_LITE=ON` starts cleanly with zero arguments (NVIDIA device
+creation succeeds, no crash, matching the "must always run with zero
+arguments and zero network" requirement) after the `app.realize()` fix
+above. The access violation that preceded the fix is confirmed gone, not
+just theorized away by reading the diff.

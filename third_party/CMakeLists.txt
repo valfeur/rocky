@@ -21,6 +21,19 @@ set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "" FORCE)
 
 set(ROCKY_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# Some vendored sub-projects (VSG, vsgXchange) persist their own
+# CMAKE_DISABLE_FIND_PACKAGE_<name> CACHE INTERNAL variable once built, to
+# stop a *second* find_package() call from finding some unrelated
+# installed copy. That's harmless on a single from-scratch configure, but
+# it survives in CMakeCache.txt and breaks the *next* incremental
+# reconfigure: find_package(... REQUIRED) runs again below, and CMake
+# refuses DISABLED+REQUIRED outright before it ever reaches our
+# OVERRIDE_FIND_PACKAGE redirect. Clear these first so every configure
+# (fresh or incremental) behaves the same way.
+foreach(_rocky_lite_pkg glm EnTT spdlog nlohmann_json glslang vsg vsgXchange)
+    unset(CMAKE_DISABLE_FIND_PACKAGE_${_rocky_lite_pkg} CACHE)
+endforeach()
+
 # ---- glm (header-only math) ----
 FetchContent_Declare(glm
     SOURCE_DIR "${ROCKY_THIRD_PARTY_DIR}/glm"

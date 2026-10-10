@@ -2,3 +2,11 @@ build/vcpkg
 build/x64-windows
 build/install/
 imgui.ini
+
+# CLion project settings (local to each dev's machine).
+/.idea/
+
+# examples/lite_tactical: user-supplied aircraft models (never fetched or
+# committed by this fork -- see examples/lite_tactical/models/README.md).
+/examples/lite_tactical/models/*
+!/examples/lite_tactical/models/README.md

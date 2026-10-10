@@ -184,6 +184,11 @@ endif()
 # source code
 add_subdirectory(src)
 
+# rocky-lite's reference example (ROCKY_LITE_SPEC.md section 5): a globe
+# with an orbiting aircraft and a radar beam, built entirely from the
+# lite configuration with no network and no bundled data.
+add_subdirectory(examples)
+
 # Strict conformance
 add_compile_options(
     $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/permissive->
